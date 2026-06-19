@@ -1,0 +1,179 @@
+-- Grim/Pool.u
+-- Mining engine core — Stratum session management, loops, payouts, coin lifecycle
+-- All functions are ability-typed; no implementation details here
+-- Handlers provide the runtime (TCP socket vs Cloud pool service)
+
+use Grim.Types
+use Grim.Abilities
+use Grim.Math
+
+--------------------------------------------------------------------------------
+-- PROOF LOOP
+-- Continuous loop: receive shares -> apply reputation delta -> audit -> stream
+-- This is the hot path. Runs forever under Mining + Reputation + Audit + Stream
+--------------------------------------------------------------------------------
+
+proofLoop : '{Mining, Reputation, Audit, Stream} ()
+proofLoop =
+  do
+    share  = !receiveShare
+    delta  = miningDelta share
+    applyDelta share.minerId (Int.fromNat delta)
+    record share.minerId "share.accepted"
+      [ ("coin",       share.coin)
+      , ("difficulty", Nat.toText share.difficulty)
+      , ("delta",      Nat.toText delta)
+      ]
+    broadcastShare share
+    proofLoop
+
+-- Block found loop — runs concurrently with proofLoop
+blockLoop : '{Mining, Reputation, Audit, Stream, Knowledge} ()
+blockLoop =
+  do
+    block  = !receiveBlock
+    delta  = blockDelta block
+    applyDelta block.finder (Int.fromNat delta)
+    record block.finder "block.found"
+      [ ("coin",   block.coin)
+      , ("height", Nat.toText block.height)
+      , ("reward", Nat.toText block.reward)
+      , ("delta",  Nat.toText delta)
+      ]
+    -- Store block as a content-addressed Knowledge entity
+    _ = store BlockRecord block block.finder
+    broadcastBlock block
+    blockLoop
+
+--------------------------------------------------------------------------------
+-- PAYOUT
+-- Compute payouts for all miners in a PPLNS window after a block is found
+--------------------------------------------------------------------------------
+
+type Payout = {
+  minerId : Text,
+  amount  : Nat
+}
+
+-- Compute the PPLNS payout list from a block and the current session window
+computePayouts : Block -> [MinerSession] -> [Payout]
+computePayouts block sessions =
+  let totalShares = List.foldLeft (\acc s -> acc + s.shares) 0 sessions
+      reward      = block.reward
+  List.map
+    (\s -> { minerId = s.minerId, amount = pplns s.shares totalShares reward })
+    sessions
+
+-- Apply payouts — audit each payment
+applyPayouts : Block -> [Payout] -> '{Audit} ()
+applyPayouts block payouts =
+  do
+    List.each payouts \p ->
+      record "system" "payout.issued"
+        [ ("minerId", p.minerId)
+        , ("coin",    block.coin)
+        , ("amount",  Nat.toText p.amount)
+        , ("height",  Nat.toText block.height)
+        ]
+
+--------------------------------------------------------------------------------
+-- VARDIFF
+-- Adjust per-miner difficulty to keep share rate near target
+--------------------------------------------------------------------------------
+
+-- Target: one share per 15 seconds
+targetShareInterval : Nat
+targetShareInterval = 15
+
+-- Calculate new difficulty for a miner session
+adjustDifficulty : MinerSession -> Nat -> Nat
+adjustDifficulty session currentDiff =
+  vardiff currentDiff session.hashrate targetShareInterval
+
+--------------------------------------------------------------------------------
+-- COIN LIFECYCLE
+-- Register, start, stop, and monitor coin nodes
+-- Requires Auth (Operator+) for mutations
+--------------------------------------------------------------------------------
+
+-- Register a new coin into the pool (Operator+)
+registerCoinGuarded : CoinDef -> '{Mining, Auth, Audit} ()
+registerCoinGuarded coin =
+  do
+    requireRole Operator
+    registerCoin coin
+    record !currentUser.username "coin.registered"
+      [ ("ticker", coin.ticker)
+      , ("algo",   algoToText coin.algorithm)
+      ]
+
+-- Start a coin node (Admin+)
+startNodeGuarded : Text -> '{Mining, Auth, Audit} ()
+startNodeGuarded ticker =
+  do
+    requireRole Admin
+    startNode ticker
+    record !currentUser.username "node.started" [("ticker", ticker)]
+
+-- Stop a coin node (Admin+)
+stopNodeGuarded : Text -> '{Mining, Auth, Audit} ()
+stopNodeGuarded ticker =
+  do
+    requireRole Admin
+    stopNode ticker
+    record !currentUser.username "node.stopped" [("ticker", ticker)]
+
+-- Poll node status and stream changes
+nodeMonitorLoop : Text -> NodeStatus -> '{Mining, Stream, Audit} ()
+nodeMonitorLoop ticker lastStatus =
+  do
+    current = nodeStatus ticker
+    if current != lastStatus then
+      broadcastNodeStatus ticker current
+      record "system" "node.statusChange"
+        [ ("ticker", ticker)
+        , ("status", nodeStatusToText current)
+        ]
+    nodeMonitorLoop ticker current
+
+--------------------------------------------------------------------------------
+-- SESSION SUMMARY
+-- Snapshot of the pool state for dashboard / stream consumers
+--------------------------------------------------------------------------------
+
+type PoolSummary = {
+  activeSessions : Nat,
+  totalHashrate  : Nat,
+  coins          : [Text]
+}
+
+poolSummary : '{Mining} PoolSummary
+poolSummary =
+  do
+    sessions  = !getSessions
+    hashrate  = !getCurrentHashrate
+    { activeSessions = List.size sessions
+    , totalHashrate  = hashrate
+    , coins          = List.map (\s -> s.minerId) sessions
+    }
+
+--------------------------------------------------------------------------------
+-- UTILITIES
+--------------------------------------------------------------------------------
+
+algoToText : Algorithm -> Text
+algoToText algo =
+  match algo with
+    Skein    -> "skein"
+    Scrypt   -> "scrypt"
+    SHA256d  -> "sha256d"
+    Qubit    -> "qubit"
+    OdoCrypt -> "odocrypt"
+
+nodeStatusToText : NodeStatus -> Text
+nodeStatusToText status =
+  match status with
+    NodeRunning    -> "running"
+    NodeStopped    -> "stopped"
+    NodeSyncing    -> "syncing"
+    NodeError msg  -> "error: " ++ msg
