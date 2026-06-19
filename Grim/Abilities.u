@@ -1,0 +1,174 @@
+-- Grim/Abilities.u
+-- Full ability surface for the Grim engine
+-- These are interfaces only — zero implementation here
+-- Handlers live in Grim.Handlers.Local and Grim.Handlers.Cloud
+
+use Grim.Types
+
+--------------------------------------------------------------------------------
+-- MINING
+-- Self-hosted handler: Stratum V1 TCP socket
+-- Cloud handler:       Unison Cloud distributed pool service
+--------------------------------------------------------------------------------
+
+ability Mining where
+  -- Receive the next share from the queue (blocks until available)
+  receiveShare       : Share
+  -- Receive the next found block
+  receiveBlock       : Block
+  -- Current aggregate hashrate across all sessions (H/s)
+  getCurrentHashrate : Nat
+  -- All currently connected miner sessions
+  getSessions        : [MinerSession]
+  -- Register a new coin definition into the pool
+  registerCoin       : CoinDef -> ()
+  -- Get node status for a given coin ticker
+  nodeStatus         : Text -> NodeStatus
+  -- Start a coin node
+  startNode          : Text -> ()
+  -- Stop a coin node
+  stopNode           : Text -> ()
+
+--------------------------------------------------------------------------------
+-- REPUTATION
+-- Self-hosted handler: local file-based score store
+-- Cloud handler:       Unison Cloud distributed reputation service
+--------------------------------------------------------------------------------
+
+ability Reputation where
+  -- Get current reputation score for a user id
+  getScore           : Text -> Nat
+  -- Apply a delta to a user's reputation (positive or negative as Int)
+  applyDelta         : Text -> Int -> ()
+  -- Get full score history for provenance
+  getHistory         : Text -> [Nat]
+  -- Recalculate role from current score (triggers governance sync)
+  syncRole           : Text -> Role
+  -- Recalculate tier from current score
+  syncTier           : Text -> Tier
+
+--------------------------------------------------------------------------------
+-- GOVERNANCE
+-- Self-hosted handler: config-file governance store
+-- Cloud handler:       Unison Cloud distributed governance service
+--------------------------------------------------------------------------------
+
+ability Governance where
+  -- Current active governance mode for this instance
+  currentMode        : GovernanceMode
+  -- Transition to a new governance mode (caller must be authorized)
+  setMode            : GovernanceMode -> ()
+  -- Check if a user id can perform a given action under current mode
+  checkAccess        : Text -> Action -> Bool
+  -- Get the full governance history (mode transitions with audit)
+  getModeHistory     : [RevisionSummary]
+
+--------------------------------------------------------------------------------
+-- AUTH
+-- Self-hosted handler: scrypt + HS256 JWT (main-style ward)
+-- Cloud handler:       Ed25519 cert + scope-bound JWT (Lancia-style ward)
+--------------------------------------------------------------------------------
+
+ability Auth where
+  -- Get the currently authenticated user (raises NotAuthenticated if none)
+  currentUser        : User
+  -- Assert minimum role — raises InsufficientRole if not met
+  requireRole        : Role -> ()
+  -- Assert minimum tier — raises InsufficientTier if not met
+  requireTier        : Tier -> ()
+  -- Password login — returns User or raises AuthError
+  login              : Text -> Text -> User
+  -- Cert-based login — nonce + signature + cert payload
+  loginCert          : Text -> Text -> CertPayload -> User
+  -- Issue a new session token for a user
+  issueToken         : User -> Text
+  -- Revoke a token by jti
+  revokeToken        : Text -> ()
+  -- Provision a new owner cert (Citadel only)
+  provisionCert      : Text -> Tier -> CertPayload
+  -- List all users (Admin+)
+  listUsers          : [User]
+  -- Create a new user (Admin+)
+  createUser         : Text -> Text -> Role -> User
+  -- Update a user's role (Admin+)
+  setRole            : Text -> Role -> ()
+  -- Delete a user (Owner only)
+  deleteUser         : Text -> ()
+
+--------------------------------------------------------------------------------
+-- KNOWLEDGE
+-- Self-hosted handler: local SQLite or file-based entity store
+-- Cloud handler:       Unison Cloud distributed knowledge service
+--------------------------------------------------------------------------------
+
+ability Knowledge where
+  -- Store a value as a content-addressed entity with provenance
+  store              : forall a. EntityType -> a -> Text -> Entity a
+  -- Retrieve an entity by its content hash
+  get                : forall a. Hash -> Optional (Entity a)
+  -- Get full revision history for an entity hash
+  history            : forall a. Hash -> [Entity a]
+  -- Search entities by type
+  listByType         : forall a. EntityType -> [Entity a]
+  -- Update an entity — creates a new revision linked to previous
+  update             : forall a. Hash -> a -> Text -> Entity a
+  -- Get facts attached to an entity
+  getFacts           : Hash -> [Fact]
+  -- Add a fact to an entity
+  addFact            : Hash -> Fact -> ()
+
+--------------------------------------------------------------------------------
+-- AUDIT
+-- Self-hosted handler: local chained JSONL file (tamper-evident)
+-- Cloud handler:       Unison Cloud append-only distributed log
+--------------------------------------------------------------------------------
+
+ability Audit where
+  -- Append an audit entry (actor, event, meta)
+  record             : Text -> Text -> [(Text, Text)] -> ()
+  -- Get recent audit entries, newest first
+  recent             : Nat -> [AuditEntry]
+  -- Get audit entries for a specific actor
+  forActor           : Text -> [AuditEntry]
+  -- Verify the entire audit chain integrity
+  verifyChain        : Bool
+
+--------------------------------------------------------------------------------
+-- VAULT
+-- Self-hosted handler: AES-256-GCM local vault (MagoFonte vault model)
+-- Cloud handler:       Unison Cloud encrypted secret service
+--------------------------------------------------------------------------------
+
+ability Vault where
+  -- Store a secret under a key (owner derived from Auth.currentUser)
+  storeSecret        : Text -> Bytes -> ()
+  -- Retrieve a secret by key (authorized to owner only)
+  getSecret          : Text -> Optional Bytes
+  -- List secret keys owned by current user
+  listSecrets        : [Text]
+  -- Rotate a secret — creates new entry linked to previous hash
+  rotateSecret       : Text -> Bytes -> ()
+  -- Delete a secret (Owner only)
+  deleteSecret       : Text -> ()
+  -- Store mining credentials for a coin
+  storeMiningCreds   : Text -> Text -> Text -> ()
+  -- Retrieve mining credentials for a coin ticker
+  getMiningCreds     : Text -> Optional SecureData
+
+--------------------------------------------------------------------------------
+-- STREAM
+-- Self-hosted handler: WebSocket broadcast (MagoFonte stream module)
+-- Cloud handler:       Unison Cloud pub/sub service
+--------------------------------------------------------------------------------
+
+ability Stream where
+  -- Broadcast a share event to all subscribers
+  broadcastShare      : Share -> ()
+  -- Broadcast a block found event
+  broadcastBlock      : Block -> ()
+  -- Broadcast a reputation change event
+  broadcastRepChange  : Text -> Nat -> ()
+  -- Broadcast a governance mode change
+  broadcastModeChange : GovernanceMode -> ()
+  -- Broadcast a node status change
+  broadcastNodeStatus : Text -> NodeStatus -> ()
