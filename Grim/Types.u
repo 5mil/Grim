@@ -1,0 +1,201 @@
+-- Grim/Types.u
+-- Unified type system for the Grim engine
+-- Replaces: MagoFonte types, Lancia types, dir types
+
+--------------------------------------------------------------------------------
+-- IDENTITY & ACCESS
+--------------------------------------------------------------------------------
+
+type Role = Owner | Admin | Operator | Member | Banned
+
+type Tier = Hearth | Forge | Foundry | Citadel
+
+type User = {
+  id         : Text,
+  username   : Text,
+  role       : Role,
+  tier       : Tier,
+  reputation : Nat,
+  createdAt  : Nat
+}
+
+validateUser : User -> Bool
+validateUser user =
+  user.reputation <= 100
+  && user.id != ""
+  && user.username != ""
+
+--------------------------------------------------------------------------------
+-- GOVERNANCE
+--------------------------------------------------------------------------------
+
+type GovernanceMode = Solo | Board | Open
+
+type Action
+  = View
+  | Edit
+  | Approve
+  | Delete
+  | ManageUsers
+  | LaunchCoin
+  | ManageVault
+  | ProvisionCert
+  | ManageNodes
+
+--------------------------------------------------------------------------------
+-- MINING  (MagoFonte core)
+--------------------------------------------------------------------------------
+
+type Algorithm
+  = Skein
+  | Scrypt
+  | SHA256d
+  | Qubit
+  | OdoCrypt
+
+type CoinDef = {
+  name        : Text,
+  ticker      : Text,
+  algorithm   : Algorithm,
+  rpcPort     : Nat,
+  stratumPort : Nat,
+  diff        : Nat,
+  reward      : Nat
+}
+
+type Share = {
+  minerId    : Text,
+  coin       : Text,
+  difficulty : Nat,
+  timestamp  : Nat
+}
+
+type Block = {
+  height    : Nat,
+  hash      : Text,
+  reward    : Nat,
+  finder    : Text,
+  coin      : Text,
+  timestamp : Nat
+}
+
+type NodeStatus = NodeRunning | NodeStopped | NodeSyncing | NodeError Text
+
+type MinerSession = {
+  minerId   : Text,
+  connected : Nat,
+  hashrate  : Nat,
+  shares    : Nat
+}
+
+--------------------------------------------------------------------------------
+-- KNOWLEDGE  (dir core)
+--------------------------------------------------------------------------------
+
+type EntityType
+  = KnowledgeArticle
+  | CoinEntity
+  | BlockRecord
+  | MinerProfile
+  | GovernanceRecord
+
+type Fact = {
+  claim       : Text,
+  source      : Text,
+  credibility : Nat
+}
+
+type Entity a = {
+  hash       : Hash,
+  entityType : EntityType,
+  value      : a,
+  facts      : [Fact],
+  previous   : Optional Hash,
+  timestamp  : Nat,
+  author     : Text
+}
+
+type RevisionSummary = {
+  hash      : Hash,
+  author    : Text,
+  timestamp : Nat,
+  summary   : Text
+}
+
+--------------------------------------------------------------------------------
+-- VAULT  (Lancia + MagoFonte operator-owned)
+--------------------------------------------------------------------------------
+
+type EncryptedBytes = Bytes
+
+type VaultEntry = {
+  key            : Text,
+  encryptedValue : EncryptedBytes,
+  owner          : Text,
+  timestamp      : Nat,
+  previousHash   : Optional Hash
+}
+
+type SecureData
+  = VaultSecret VaultEntry
+  | MiningCredentials { rpcUser : Text, rpcPass : Text, coin : Text }
+  | CertPrivateKey    { certId : Text, keyBytes : EncryptedBytes }
+
+--------------------------------------------------------------------------------
+-- AUTH  (Lancia ward)
+--------------------------------------------------------------------------------
+
+type TokenClaims = {
+  sub        : Text,
+  username   : Text,
+  role       : Role,
+  tier       : Tier,
+  scope      : [Text],
+  exp        : Nat,
+  jti        : Text
+}
+
+type CertPayload = {
+  certId     : Text,
+  sub        : Text,
+  instanceId : Text,
+  tier       : Tier,
+  scope      : [Text],
+  exp        : Nat
+}
+
+type AuthError
+  = NotAuthenticated
+  | InsufficientRole Role Role
+  | InsufficientTier Tier Tier
+  | TokenExpired
+  | CertExpired
+  | InvalidSignature
+  | ScopeNotPermitted Text
+
+--------------------------------------------------------------------------------
+-- AUDIT
+--------------------------------------------------------------------------------
+
+type AuditEntry = {
+  hash      : Hash,
+  previous  : Optional Hash,
+  event     : Text,
+  actor     : Text,
+  timestamp : Nat,
+  meta      : [(Text, Text)]
+}
+
+--------------------------------------------------------------------------------
+-- DEPLOYMENT  (handler profile selection)
+--------------------------------------------------------------------------------
+
+type DeploymentProfile = LocalSelfHosted | LanciaCloud
+
+type GrimConfig = {
+  profile        : DeploymentProfile,
+  instanceId     : Text,
+  governanceMode : GovernanceMode,
+  defaultTier    : Tier,
+  coins          : [CoinDef]
+}
