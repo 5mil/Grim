@@ -1,0 +1,215 @@
+-- Grim/Math.u
+-- All pure functions for the Grim engine — zero effects, fully testable
+-- Covers: reputation, governance, mining, tier progression, audit chaining
+
+use Grim.Types
+
+--------------------------------------------------------------------------------
+-- REPUTATION  (dir WikiTrust)
+--------------------------------------------------------------------------------
+
+-- Core trust score from contribution history
+-- approved: accepted edits, rejected: reverted edits, rollbacks: malicious rollbacks
+wikiTrust : Nat -> Nat -> Nat -> Nat
+wikiTrust approved rejected rollbacks =
+  let raw = 50 + (approved * 2) - (rejected * 2) - (rollbacks * 5)
+  Nat.clamp 0 100 raw
+
+-- Apply a mining share delta to an existing reputation score
+-- Difficulty weighting: every 1024 difficulty = +1 bonus on top of base
+miningDelta : Share -> Nat
+miningDelta share =
+  let base  = 1
+      bonus = share.difficulty / 1024
+  base + bonus
+
+-- Apply a block-found delta — significant reputation boost
+blockDelta : Block -> Nat
+blockDelta _block = 10
+
+-- Aggregate reputation from full history
+reputationFromHistory : [Nat] -> Nat
+reputationFromHistory history =
+  match history with
+    [] -> 50  -- baseline for new users
+    _  ->
+      let total = List.foldLeft (+) 0 history
+      Nat.clamp 0 100 (total / List.size history)
+
+-- Determine target role from reputation score
+reputationToRole : Nat -> Role
+reputationToRole score =
+  if score >= 90 then Admin
+  else if score >= 60 then Operator
+  else if score >= 20 then Member
+  else Banned
+
+-- Determine target governance mode from reputation score
+reputationToGovernanceMode : Nat -> GovernanceMode
+reputationToGovernanceMode score =
+  if score >= 90 then Board
+  else if score >= 75 then Open
+  else Solo
+
+--------------------------------------------------------------------------------
+-- GOVERNANCE  (dir modes + Lancia roles/tiers)
+--------------------------------------------------------------------------------
+
+-- Primary access gate — mode x user x action -> Bool
+canPerformAction : GovernanceMode -> User -> Action -> Bool
+canPerformAction mode user action =
+  let roleOk = meetsTierForAction user.tier action
+      repOk  = user.reputation >= 20
+  match mode with
+    Solo ->
+      user.role == Owner
+    Board ->
+      roleOk &&
+      (user.role == Owner || user.role == Admin || user.tier >= Foundry)
+    Open ->
+      roleOk && repOk &&
+      (user.reputation >= 75 || user.role == Owner
+       || user.role == Admin  || user.tier >= Forge)
+
+-- Tier gate per action — independent of governance mode
+meetsTierForAction : Tier -> Action -> Bool
+meetsTierForAction tier action =
+  match action with
+    View          -> true
+    Edit          -> tier >= Forge
+    Approve       -> tier >= Foundry
+    Delete        -> tier == Citadel
+    ManageUsers   -> tier == Citadel
+    LaunchCoin    -> tier >= Foundry
+    ManageVault   -> tier >= Foundry
+    ProvisionCert -> tier == Citadel
+    ManageNodes   -> tier >= Foundry
+
+-- Check if a governance mode transition is valid
+-- Solo -> Board -> Open (progressive), reversal requires Owner
+canTransitionMode : GovernanceMode -> GovernanceMode -> User -> Bool
+canTransitionMode from to user =
+  match (from, to) with
+    (Solo,  Board) -> user.role == Owner || user.role == Admin
+    (Board, Open)  -> user.role == Owner || user.role == Admin
+    (Open,  Board) -> user.role == Owner
+    (Board, Solo)  -> user.role == Owner
+    (Open,  Solo)  -> user.role == Owner
+    _              -> false
+
+--------------------------------------------------------------------------------
+-- TIER PROGRESSION  (Lancia tiers)
+--------------------------------------------------------------------------------
+
+-- Numeric rank for tier comparison (>= semantics)
+tierRank : Tier -> Nat
+tierRank tier =
+  match tier with
+    Hearth   -> 0
+    Forge    -> 1
+    Foundry  -> 2
+    Citadel  -> 3
+
+-- Tier from reputation + role
+tierFromReputation : Nat -> Role -> Tier
+tierFromReputation score role =
+  match role with
+    Owner -> Citadel
+    Admin -> Foundry
+    _ ->
+      if score >= 90 then Foundry
+      else if score >= 60 then Forge
+      else Hearth
+
+--------------------------------------------------------------------------------
+-- MINING  (MagoFonte core math)
+--------------------------------------------------------------------------------
+
+-- VarDiff: next target difficulty given current hashrate and target share interval
+-- targetSeconds: desired seconds between shares (e.g. 15)
+vardiff : Nat -> Nat -> Nat -> Nat
+vardiff currentDiff hashrate targetSeconds =
+  let ideal = hashrate * targetSeconds
+  Nat.clamp 1 (currentDiff * 4) ideal
+
+-- PPLNS: proportional share of block reward for one miner
+-- minerShares: shares contributed by this miner in the window
+-- totalShares: total shares in the PPLNS window
+-- blockReward: total reward in satoshis
+pplns : Nat -> Nat -> Nat -> Nat
+pplns minerShares totalShares blockReward =
+  if totalShares == 0 then 0
+  else (minerShares * blockReward) / totalShares
+
+-- Difficulty from target bits (simplified)
+diffFromBits : Nat -> Nat
+diffFromBits bits =
+  if bits == 0 then 1
+  else Nat.pow 2 bits / bits
+
+--------------------------------------------------------------------------------
+-- AUDIT CHAINING
+--------------------------------------------------------------------------------
+
+-- Verify that two consecutive audit entries are properly chained
+auditChainValid : AuditEntry -> AuditEntry -> Bool
+auditChainValid prev next =
+  match next.previous with
+    None   -> false
+    Some h -> h == prev.hash
+
+-- Verify an entire audit log is an unbroken chain
+auditLogValid : [AuditEntry] -> Bool
+auditLogValid entries =
+  match entries with
+    []            -> true
+    [_]           -> true
+    e1 +: e2 +: rest ->
+      auditChainValid e1 e2 && auditLogValid (e2 +: rest)
+
+--------------------------------------------------------------------------------
+-- TESTS
+--------------------------------------------------------------------------------
+
+testWikiTrust : [Bool]
+testWikiTrust =
+  [ wikiTrust 0   0   0  == 50
+  , wikiTrust 10  0   0  == 70
+  , wikiTrust 0   10  0  == 30
+  , wikiTrust 0   0   10 == 0
+  , wikiTrust 100 0   0  == 100
+  , wikiTrust 0   100 0  == 0
+  ]
+
+testCanPerformAction : [Bool]
+testCanPerformAction =
+  let owner  = { id = "1", username = "owner",  role = Owner,  tier = Citadel, reputation = 100, createdAt = 0 }
+      admin  = { id = "2", username = "admin",  role = Admin,  tier = Foundry, reputation = 90,  createdAt = 0 }
+      member = { id = "3", username = "member", role = Member, tier = Hearth,  reputation = 30,  createdAt = 0 }
+      banned = { id = "4", username = "banned", role = Banned, tier = Hearth,  reputation = 5,   createdAt = 0 }
+  [ canPerformAction Solo  owner  Edit          == true
+  , canPerformAction Solo  member Edit          == false
+  , canPerformAction Board admin  Approve       == true
+  , canPerformAction Board member Delete        == false
+  , canPerformAction Open  admin  Edit          == true
+  , canPerformAction Open  banned Edit          == false
+  , canPerformAction Open  member ProvisionCert == false
+  ]
+
+testPplns : [Bool]
+testPplns =
+  [ pplns 100 1000 5000 == 500
+  , pplns 0   1000 5000 == 0
+  , pplns 500 500  1000 == 1000
+  , pplns 100 0    5000 == 0
+  ]
+
+testMeetsTier : [Bool]
+testMeetsTier =
+  [ meetsTierForAction Hearth  View          == true
+  , meetsTierForAction Hearth  Edit          == false
+  , meetsTierForAction Forge   Edit          == true
+  , meetsTierForAction Foundry LaunchCoin    == true
+  , meetsTierForAction Forge   ProvisionCert == false
+  , meetsTierForAction Citadel ProvisionCert == true
+  ]
