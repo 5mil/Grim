@@ -1,0 +1,217 @@
+-- Grim.Pool
+-- Stratum mining logic as pure ability-typed functions
+-- Zero implementation details here — handlers provide the runtime
+-- Self-hosted handler: Stratum V1 TCP socket via FFI shim
+-- Cloud handler: Unison Cloud distributed pool service
+-- All mutations are Auth-gated and Audit-logged
+
+use Grim.Types
+use Grim.Abilities
+use Grim.Math
+
+--------------------------------------------------------------------------------
+-- PROOF LOOP
+-- Hot path. Runs forever.
+-- Receives shares from the Mining ability queue,
+-- applies reputation delta, records to Audit, broadcasts to Stream.
+--------------------------------------------------------------------------------
+
+proofLoop : '{Mining, Reputation, Audit, Stream} ()
+proofLoop = do
+  share = !receiveShare
+  delta = miningDelta share
+  applyDelta share.minerId (Int.fromNat delta)
+  record share.minerId "share.accepted"
+    [ ("coin",     share.coin)
+    , ("difficulty", Nat.toText share.difficulty)
+    , ("delta",    Nat.toText delta)
+    ]
+  broadcastShare share
+  proofLoop
+
+--------------------------------------------------------------------------------
+-- BLOCK LOOP
+-- Runs concurrently with proofLoop.
+-- Receives found blocks, applies a larger reputation delta,
+-- stores the block as a content-addressed Knowledge entity,
+-- broadcasts to the Stream, and triggers payout computation.
+--------------------------------------------------------------------------------
+
+blockLoop : '{Mining, Reputation, Audit, Stream, Knowledge} ()
+blockLoop = do
+  block = !receiveBlock
+  delta = blockDelta block
+  applyDelta block.finder (Int.fromNat delta)
+  record block.finder "block.found"
+    [ ("coin",   block.coin)
+    , ("height", Nat.toText block.height)
+    , ("reward", Nat.toText block.reward)
+    , ("hash",   block.hash)
+    , ("delta",  Nat.toText delta)
+    ]
+  -- Store block as a provenance-chained Knowledge entity
+  store BlockRecord block block.finder
+  broadcastBlock block
+  -- Compute and apply PPLNS payouts for this block
+  sessions = !getSessions
+  payouts  = computePayouts block sessions
+  applyPayouts block payouts
+  blockLoop
+
+--------------------------------------------------------------------------------
+-- PPLNS PAYOUT
+-- Pure computation — no effects.
+-- Splits block reward proportionally across miner sessions
+-- using the Math.pplns function.
+--------------------------------------------------------------------------------
+
+type Payout = { minerId : Text, amount : Nat }
+
+computePayouts : Block -> [MinerSession] -> [Payout]
+computePayouts block sessions =
+  totalShares = List.foldLeft (s acc -> acc + s.shares) 0 sessions
+  List.map
+    (s -> { minerId = s.minerId, amount = pplns s.shares totalShares block.reward })
+    sessions
+
+-- Audit-log every payment issued after a block
+applyPayouts : Block -> [Payout] -> '{Audit} ()
+applyPayouts block payouts = do
+  List.each payouts (p ->
+    record "system" "payout.issued"
+      [ ("minerId", p.minerId)
+      , ("coin",   block.coin)
+      , ("amount", Nat.toText p.amount)
+      , ("height", Nat.toText block.height)
+      ])
+
+--------------------------------------------------------------------------------
+-- VARDIFF
+-- Per-miner difficulty adjustment.
+-- Keeps share rate near targetShareInterval seconds.
+-- Pure — uses Math.vardiff.
+--------------------------------------------------------------------------------
+
+-- Target: one share per 15 seconds
+targetShareInterval : Nat
+targetShareInterval = 15
+
+-- Compute adjusted difficulty for a miner given current diff and hashrate
+adjustDifficulty : MinerSession -> Nat -> Nat
+adjustDifficulty session currentDiff =
+  vardiff currentDiff session.hashrate targetShareInterval
+
+--------------------------------------------------------------------------------
+-- SESSION SNAPSHOT
+-- Live dashboard summary — no mutations.
+--------------------------------------------------------------------------------
+
+type PoolSummary = { activeSessions : Nat, totalHashrate : Nat, activeCoins : [Text] }
+
+poolSummary : '{Mining} PoolSummary
+poolSummary = do
+  sessions  = !getSessions
+  hashrate  = !getCurrentHashrate
+  { activeSessions = List.size sessions
+  , totalHashrate  = hashrate
+  , activeCoins    = List.map (s -> s.minerId) sessions
+  }
+
+--------------------------------------------------------------------------------
+-- COIN LIFECYCLE
+-- Register, start, stop, and monitor coin nodes.
+-- All mutations require at minimum Operator role.
+-- Node status changes are streamed and audited.
+--------------------------------------------------------------------------------
+
+-- Register a new coin into the pool — Operator
+registerCoinGuarded : CoinDef -> '{Mining, Auth, Audit} ()
+registerCoinGuarded coin = do
+  requireRole Operator
+  registerCoin coin
+  user = !currentUser
+  record user.username "coin.registered"
+    [ ("ticker", coin.ticker)
+    , ("algo",   algoToText coin.algorithm)
+    , ("port",   Nat.toText coin.stratumPort)
+    ]
+
+-- Start a coin node — Admin
+startNodeGuarded : Text -> '{Mining, Auth, Audit} ()
+startNodeGuarded ticker = do
+  requireRole Admin
+  startNode ticker
+  user = !currentUser
+  record user.username "node.started" [("ticker", ticker)]
+
+-- Stop a coin node — Admin
+stopNodeGuarded : Text -> '{Mining, Auth, Audit} ()
+stopNodeGuarded ticker = do
+  requireRole Admin
+  stopNode ticker
+  user = !currentUser
+  record user.username "node.stopped" [("ticker", ticker)]
+
+-- Continuous node monitor — detects status changes and streams them
+-- Runs per-coin; spawn one instance per registered coin
+nodeMonitorLoop : Text -> NodeStatus -> '{Mining, Stream, Audit} ()
+nodeMonitorLoop ticker lastStatus = do
+  current = nodeStatus ticker
+  if current != lastStatus then
+    broadcastNodeStatus ticker current
+    record "system" "node.statusChange"
+      [ ("ticker", ticker)
+      , ("status", nodeStatusToText current)
+      ]
+  nodeMonitorLoop ticker current
+
+--------------------------------------------------------------------------------
+-- UTILITIES
+-- Text representations for audit metadata and stream events.
+--------------------------------------------------------------------------------
+
+algoToText : Algorithm -> Text
+algoToText algo = match algo with
+  Skein   -> "skein"
+  Scrypt  -> "scrypt"
+  SHA256d -> "sha256d"
+  Qubit   -> "qubit"
+  OdoCrypt -> "odocrypt"
+
+nodeStatusToText : NodeStatus -> Text
+nodeStatusToText status = match status with
+  NodeRunning  -> "running"
+  NodeStopped  -> "stopped"
+  NodeSyncing  -> "syncing"
+  NodeError msg -> "error: " ++ msg
+
+--------------------------------------------------------------------------------
+-- TESTS
+--------------------------------------------------------------------------------
+
+testComputePayouts : Bool
+testComputePayouts =
+  block    = { height = 100, hash = "abc", reward = 1000, finder = "miner1", coin = "DGB", timestamp = 0 }
+  sessions =
+    [ { minerId = "miner1", connected = 0, hashrate = 500, shares = 500 }
+    , { minerId = "miner2", connected = 0, hashrate = 500, shares = 500 }
+    ]
+  payouts  = computePayouts block sessions
+  -- Each miner contributed 50% so each gets 500
+  List.all (p -> p.amount == 500) payouts
+
+testAdjustDifficulty : Bool
+testAdjustDifficulty =
+  session = { minerId = "miner1", connected = 0, hashrate = 15000, shares = 100 }
+  -- hashrate 15000 * targetInterval 15 = 225000, clamped to [currentDiff/4, currentDiff*4]
+  -- vardiff 1024 15000 15 -> should be > 1024
+  adjusted = adjustDifficulty session 1024
+  adjusted > 1024
+
+testAlgoToText : Bool
+testAlgoToText =
+  algoToText Skein   == "skein"   &&
+  algoToText Scrypt  == "scrypt"  &&
+  algoToText SHA256d == "sha256d" &&
+  algoToText Qubit   == "qubit"   &&
+  algoToText OdoCrypt == "odocrypt"
