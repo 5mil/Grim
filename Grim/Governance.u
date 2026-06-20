@@ -1,0 +1,235 @@
+-- Grim.Governance
+-- Mode switching, access rules, and audit chain for governance
+-- Replaces dir's plugin-dir-governance and grimoire's Loop 3
+-- All mode transitions are Auth-gated, Audit-logged, and stored
+-- as content-addressed Knowledge entities.
+--
+-- Handler contract:
+--   Self-hosted : config-file governance store, local JWT issuer
+--   Cloud       : Unison Cloud distributed governance + Lancia ward
+--
+-- Design note:
+--   canPerformAction lives in Grim.Math — pure, zero effects.
+--   This module wraps it with the Auth/Audit/Governance/Knowledge
+--   ability surface to produce guarded, auditable access decisions.
+
+use Grim.Types
+use Grim.Abilities
+use Grim.Math
+
+--------------------------------------------------------------------------------
+-- ACCESS GATE
+-- The primary runtime access check.
+-- Reads current governance mode, checks canPerformAction (pure),
+-- and raises an Abort if access is denied.
+-- This is the single call-site that replaces all of grimoire's Loop 3 logic.
+--------------------------------------------------------------------------------
+
+guardedAction : Action -> '{Governance, Auth, Audit} ()
+guardedAction action = do
+  user = !currentUser
+  mode = !currentMode
+  if canPerformAction mode user action then
+    record user.username "governance.allow"
+      [ ("action", actionToText action)
+      , ("mode",   modeToText mode)
+      , ("role",   roleToText user.role)
+      , ("tier",   tierToText user.tier)
+      ]
+  else
+    record user.username "governance.deny"
+      [ ("action", actionToText action)
+      , ("mode",   modeToText mode)
+      , ("role",   roleToText user.role)
+      , ("tier",   tierToText user.tier)
+      ]
+    Abort.abort ("Access denied: " ++ actionToText action ++
+                 " requires higher role or governance mode")
+
+--------------------------------------------------------------------------------
+-- MODE TRANSITION
+-- Transition governance mode with full validation.
+-- Uses canTransitionMode (pure) to check authorization.
+-- On success: persists change via Governance ability,
+--             stores a GovernanceRecord in Knowledge,
+--             broadcasts mode change to Stream,
+--             appends to Audit chain.
+--------------------------------------------------------------------------------
+
+transitionMode : GovernanceMode -> '{Governance, Auth, Audit, Knowledge, Stream} ()
+transitionMode newMode = do
+  user    = !currentUser
+  current = !currentMode
+  if canTransitionMode current newMode user then
+    setMode newMode
+    store GovernanceRecord
+      { modeFrom  = current
+      , modeTo    = newMode
+      , actor     = user.username
+      , timestamp = 0   -- handler provides real timestamp
+      }
+      user.username
+    broadcastModeChange newMode
+    record user.username "governance.modeTransition"
+      [ ("from", modeToText current)
+      , ("to",   modeToText newMode)
+      , ("role", roleToText user.role)
+      ]
+  else
+    record user.username "governance.modeTransitionDenied"
+      [ ("from", modeToText current)
+      , ("to",   modeToText newMode)
+      , ("role", roleToText user.role)
+      ]
+    Abort.abort ("Mode transition denied: " ++
+                 modeToText current ++ " -> " ++ modeToText newMode)
+
+--------------------------------------------------------------------------------
+-- REPUTATION SYNC
+-- Called after a reputation delta is applied (e.g. from proofLoop or blockLoop).
+-- Recalculates role and tier from current score,
+-- checks if a governance mode upgrade is now possible,
+-- and broadcasts a reputation change event.
+-- This collapses grimoire's Loop 3 role-promotion engine into a
+-- pure function call + handler dispatch.
+--------------------------------------------------------------------------------
+
+reputationSync : Text -> '{Reputation, Governance, Audit, Stream} ()
+reputationSync userId = do
+  score   = getScore userId
+  newRole = reputationToRole score
+  newMode = reputationToGovernanceMode score
+  syncRole userId
+  syncTier userId
+  broadcastRepChange userId score
+  record "system" "governance.reputationSync"
+    [ ("userId",  userId)
+    , ("score",   Nat.toText score)
+    , ("role",    roleToText newRole)
+    , ("mode",    modeToText newMode)
+    ]
+
+--------------------------------------------------------------------------------
+-- GOVERNANCE HISTORY
+-- Return all governance mode transitions from the Knowledge store.
+-- Uses listByType to retrieve all GovernanceRecord entities.
+-- Read is open — no tier requirement.
+--------------------------------------------------------------------------------
+
+governanceHistory : '{Knowledge, Audit} [Entity GovernanceRecord]
+governanceHistory = do
+  record "system" "governance.history" []
+  listByType GovernanceRecord
+
+--------------------------------------------------------------------------------
+-- ACCESS CHECK (non-throwing)
+-- Soft version of guardedAction — returns Bool instead of aborting.
+-- Used by dashboard and UI layers to render permission-aware views.
+--------------------------------------------------------------------------------
+
+canAct : Action -> '{Governance, Auth} Bool
+canAct action = do
+  user = !currentUser
+  mode = !currentMode
+  canPerformAction mode user action
+
+--------------------------------------------------------------------------------
+-- AUDIT CHAIN VERIFICATION
+-- Verify the integrity of the governance audit log.
+-- Wraps Audit.verifyChain with an admin gate and an audit log entry.
+--------------------------------------------------------------------------------
+
+verifyGovernanceAudit : '{Governance, Auth, Audit} Bool
+verifyGovernanceAudit = do
+  requireRole Admin
+  user   = !currentUser
+  result = verifyChain
+  record user.username "governance.auditVerify"
+    [("intact", if result then "true" else "false")]
+  result
+
+--------------------------------------------------------------------------------
+-- GOVERNANCE RECORD TYPE
+-- Stored as a Knowledge entity on every mode transition.
+-- Provides the persistent, provenance-chained governance ledger
+-- that replaces dir's governance plugin records.
+--------------------------------------------------------------------------------
+
+type GovernanceRecord =
+  { modeFrom  : GovernanceMode
+  , modeTo    : GovernanceMode
+  , actor     : Text
+  , timestamp : Nat
+  }
+
+--------------------------------------------------------------------------------
+-- UTILITIES
+--------------------------------------------------------------------------------
+
+modeToText : GovernanceMode -> Text
+modeToText mode = match mode with
+  Solo  -> "solo"
+  Board -> "board"
+  Open  -> "open"
+
+actionToText : Action -> Text
+actionToText action = match action with
+  View          -> "view"
+  Edit          -> "edit"
+  Approve       -> "approve"
+  Delete        -> "delete"
+  ManageUsers   -> "manage_users"
+  LaunchCoin    -> "launch_coin"
+  ManageVault   -> "manage_vault"
+  ProvisionCert -> "provision_cert"
+  ManageNodes   -> "manage_nodes"
+
+roleToText : Role -> Text
+roleToText role = match role with
+  Owner    -> "owner"
+  Admin    -> "admin"
+  Operator -> "operator"
+  Member   -> "member"
+  Banned   -> "banned"
+
+tierToText : Tier -> Text
+tierToText tier = match tier with
+  Hearth   -> "hearth"
+  Forge    -> "forge"
+  Foundry  -> "foundry"
+  Citadel  -> "citadel"
+
+--------------------------------------------------------------------------------
+-- TESTS
+--------------------------------------------------------------------------------
+
+testModeToText : Bool
+testModeToText =
+  modeToText Solo  == "solo"  &&
+  modeToText Board == "board" &&
+  modeToText Open  == "open"
+
+testActionToText : Bool
+testActionToText =
+  actionToText View          == "view"          &&
+  actionToText Edit          == "edit"          &&
+  actionToText ManageVault   == "manage_vault"  &&
+  actionToText ProvisionCert == "provision_cert"
+
+testCanAct_solo_owner : Bool
+testCanAct_solo_owner =
+  -- In Solo mode, only Owner can Edit
+  user = { id = "u1", username = "alice", role = Owner, tier = Citadel, reputation = 100, createdAt = 0 }
+  canPerformAction Solo user Edit
+
+testCanAct_open_member : Bool
+testCanAct_open_member =
+  -- In Open mode, a Member with reputation 80 and Forge tier can Edit
+  user = { id = "u2", username = "bob", role = Member, tier = Forge, reputation = 80, createdAt = 0 }
+  canPerformAction Open user Edit
+
+testCanAct_board_member_denied : Bool
+testCanAct_board_member_denied =
+  -- In Board mode, a plain Member cannot Approve
+  user = { id = "u3", username = "carol", role = Member, tier = Hearth, reputation = 30, createdAt = 0 }
+  not (canPerformAction Board user Approve)

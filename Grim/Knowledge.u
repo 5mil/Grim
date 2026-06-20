@@ -1,0 +1,213 @@
+-- Grim.Knowledge
+-- Entity store, provenance chaining, revision history
+-- Replaces dir's NocoBase entity layer as a native Unison ability
+-- All writes are Auth-gated and Audit-logged
+-- All reads return content-addressed, provenance-linked entities
+--
+-- Handler contract:
+--   Self-hosted : local SQLite or file-based entity store via FFI
+--   Cloud       : Unison Cloud distributed knowledge service
+
+use Grim.Types
+use Grim.Abilities
+use Grim.Math
+
+--------------------------------------------------------------------------------
+-- GUARDED STORE
+-- Create a new content-addressed entity.
+-- Minimum tier: Forge (contributors and above can write).
+-- Returns the stored entity with its computed hash and provenance.
+--------------------------------------------------------------------------------
+
+knowledgeStore : forall a. EntityType -> a -> Text -> '{Knowledge, Auth, Audit} (Entity a)
+knowledgeStore entityType value summary = do
+  requireTier Forge
+  user   = !currentUser
+  entity = store entityType value user.username
+  record user.username "knowledge.store"
+    [ ("hash",    Hash.toText entity.hash)
+    , ("type",    entityTypeToText entityType)
+    , ("summary", summary)
+    ]
+  entity
+
+--------------------------------------------------------------------------------
+-- GUARDED UPDATE
+-- Create a new revision of an existing entity.
+-- Previous hash is preserved in the new entity's `previous` field.
+-- Minimum tier: Forge. Owner of original entity or Admin can always update.
+-- Returns the new revision.
+--------------------------------------------------------------------------------
+
+knowledgeUpdate : forall a. Hash -> a -> Text -> '{Knowledge, Auth, Audit} (Entity a)
+knowledgeUpdate previousHash newValue summary = do
+  requireTier Forge
+  user      = !currentUser
+  newEntity = update previousHash newValue user.username
+  record user.username "knowledge.update"
+    [ ("previousHash", Hash.toText previousHash)
+    , ("newHash",      Hash.toText newEntity.hash)
+    , ("summary",      summary)
+    ]
+  newEntity
+
+--------------------------------------------------------------------------------
+-- GUARDED READ
+-- Retrieve an entity by content hash.
+-- Read is open — no tier requirement.
+-- Audit-logs the access for provenance.
+--------------------------------------------------------------------------------
+
+knowledgeGet : forall a. Hash -> '{Knowledge, Auth, Audit} (Optional (Entity a))
+knowledgeGet hash = do
+  user   = !currentUser
+  result = get hash
+  record user.username "knowledge.get"
+    [ ("hash",  Hash.toText hash)
+    , ("found", if Optional.isSome result then "true" else "false")
+    ]
+  result
+
+--------------------------------------------------------------------------------
+-- REVISION HISTORY
+-- Return all revisions of an entity from oldest to newest.
+-- Each Entity carries its own `previous` hash forming a chain.
+-- Read is open.
+--------------------------------------------------------------------------------
+
+knowledgeHistory : forall a. Hash -> '{Knowledge, Audit} [Entity a]
+knowledgeHistory hash = do
+  record "system" "knowledge.history" [("hash", Hash.toText hash)]
+  history hash
+
+--------------------------------------------------------------------------------
+-- FACT MANAGEMENT
+-- Facts are claims attached to an entity (claim, source, credibility 0-100).
+-- Adding a fact requires Forge tier minimum.
+-- Retrieving facts is open.
+--------------------------------------------------------------------------------
+
+knowledgeAddFact : Hash -> Fact -> '{Knowledge, Auth, Audit} ()
+knowledgeAddFact hash fact = do
+  requireTier Forge
+  user = !currentUser
+  addFact hash fact
+  record user.username "knowledge.addFact"
+    [ ("hash",        Hash.toText hash)
+    , ("claim",       fact.claim)
+    , ("source",      fact.source)
+    , ("credibility", Nat.toText fact.credibility)
+    ]
+
+knowledgeGetFacts : Hash -> '{Knowledge, Audit} [Fact]
+knowledgeGetFacts hash = do
+  record "system" "knowledge.getFacts" [("hash", Hash.toText hash)]
+  getFacts hash
+
+--------------------------------------------------------------------------------
+-- ENTITY TYPE QUERIES
+-- List all entities of a given type.
+-- Used by the sigil dashboard, pool coin loader, and governance record reader.
+-- Read is open.
+--------------------------------------------------------------------------------
+
+knowledgeListCoins : '{Knowledge} [Entity CoinDef]
+knowledgeListCoins = listByType CoinEntity
+
+knowledgeListBlocks : '{Knowledge} [Entity Block]
+knowledgeListBlocks = listByType BlockRecord
+
+knowledgeListMiners : '{Knowledge} [Entity MinerProfile]
+knowledgeListMiners = listByType MinerProfile
+
+knowledgeListArticles : '{Knowledge} [Entity Text]
+knowledgeListArticles = listByType KnowledgeArticle
+
+knowledgeListGovernanceRecords : '{Knowledge} [Entity GovernanceRecord]
+knowledgeListGovernanceRecords = listByType GovernanceRecord
+
+--------------------------------------------------------------------------------
+-- PROVENANCE CHAIN VERIFICATION
+-- Walk the revision chain of an entity and verify each link is valid.
+-- An unbroken chain means every `previous` hash resolves to a real entity
+-- and no revision was inserted out of order.
+-- Returns True if chain is intact, False with a broken hash if not.
+--------------------------------------------------------------------------------
+
+type ChainResult = ChainIntact | ChainBroken Hash
+
+verifyEntityChain : forall a. Hash -> '{Knowledge} ChainResult
+verifyEntityChain startHash =
+  revisions = history startHash
+  go : [Entity a] -> Optional Hash -> ChainResult
+  go revs previousExpected =
+    match revs with
+      [] -> ChainIntact
+      rev +: rest ->
+        match previousExpected with
+          None ->
+            -- First revision should have no previous
+            match rev.previous with
+              None    -> go rest (Some rev.hash)
+              Some h  -> ChainBroken h
+          Some expected ->
+            match rev.previous with
+              None    -> ChainBroken rev.hash
+              Some h  ->
+                if h == expected then go rest (Some rev.hash)
+                else ChainBroken h
+  go revisions None
+
+--------------------------------------------------------------------------------
+-- COIN ENTITY SYNC
+-- Called by Pool when a coin is registered or updated.
+-- Stores or updates the CoinDef as a content-addressed Knowledge entity.
+-- This makes dir the canonical coin config source.
+--------------------------------------------------------------------------------
+
+syncCoinToKnowledge : CoinDef -> '{Knowledge, Auth, Audit} (Entity CoinDef)
+syncCoinToKnowledge coin = do
+  -- Check if this coin already exists by searching for matching ticker
+  existing = List.find
+    (e -> e.value.ticker == coin.ticker)
+    !knowledgeListCoins
+  match existing with
+    None ->
+      knowledgeStore CoinEntity coin ("register coin: " ++ coin.ticker)
+    Some e ->
+      knowledgeUpdate e.hash coin ("update coin: " ++ coin.ticker)
+
+--------------------------------------------------------------------------------
+-- BLOCK ENTITY STORE
+-- Called by Pool.blockLoop after a block is found.
+-- Stores the block as a provenance-chained entity.
+--------------------------------------------------------------------------------
+
+storeBlockEntity : Block -> Text -> '{Knowledge, Auth, Audit} (Entity Block)
+storeBlockEntity block finderUsername =
+  knowledgeStore BlockRecord block
+    ("block " ++ Nat.toText block.height ++ " found by " ++ finderUsername)
+
+--------------------------------------------------------------------------------
+-- UTILITIES
+--------------------------------------------------------------------------------
+
+entityTypeToText : EntityType -> Text
+entityTypeToText t = match t with
+  KnowledgeArticle  -> "article"
+  CoinEntity        -> "coin"
+  BlockRecord       -> "block"
+  MinerProfile      -> "miner"
+  GovernanceRecord  -> "governance"
+
+--------------------------------------------------------------------------------
+-- TESTS
+--------------------------------------------------------------------------------
+
+testEntityTypeToText : Bool
+testEntityTypeToText =
+  entityTypeToText KnowledgeArticle == "article" &&
+  entityTypeToText CoinEntity       == "coin"    &&
+  entityTypeToText BlockRecord      == "block"   &&
+  entityTypeToText MinerProfile     == "miner"   &&
+  entityTypeToText GovernanceRecord == "governance"
