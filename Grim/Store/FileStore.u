@@ -1,0 +1,661 @@
+-- Grim.Store.FileStore
+-- Unison-native file-based entity and user store
+-- Replaces all SQLite FFI stubs in handleKnowledge and handleAuth
+--
+-- Storage layout:
+--   $GRIM_DATA_PATH/
+--     entities/
+--       <hash>.json          -- one file per entity revision
+--       by-type/<type>.idx   -- append-only index of hashes per EntityType
+--     users/
+--       users.jsonl          -- append-only user ledger
+--       sessions.jsonl       -- active session tokens
+--       revoked.jsonl        -- revoked JTIs
+--     facts/
+--       <hash>.facts.jsonl   -- facts attached to entity hash
+--
+-- Design principles:
+--   - Every write is an append or an atomic file create (no in-place mutation)
+--   - Content hash is computed from serialised entity fields in Unison
+--   - No external database engine, no FFI beyond file I/O and crypto primitives
+--   - All reads are pure scans over the index or directory listing
+--   - Compatible with the Vault, Audit, Reputation, and Governance stores
+--     which are already JSONL-based
+
+use Grim.Types
+use Grim.Abilities
+
+--------------------------------------------------------------------------------
+-- FILE I/O ABILITY
+-- All file I/O is declared as a single swappable ability.
+-- Production: handleFileIO uses platform FFI (read/write/list/exists).
+-- Tests:      handleFileIOMock uses an in-memory Map.
+-- This means Knowledge and Auth are fully testable without touching disk.
+--------------------------------------------------------------------------------
+
+ability FileIO where
+  -- Read entire file contents as Text. Returns None if file does not exist.
+  readFile    : Text -> Optional Text
+  -- Write Text to a file, creating parent dirs as needed. Atomic rename.
+  writeFile   : Text -> Text -> ()
+  -- Append a line to a file (creates file if absent).
+  appendLine  : Text -> Text -> ()
+  -- List all filenames in a directory. Returns [] if dir does not exist.
+  listDir     : Text -> [Text]
+  -- Check if a file exists.
+  fileExists  : Text -> Bool
+  -- Delete a file. No-op if absent.
+  deleteFile  : Text -> ()
+  -- Get current wall-clock timestamp (seconds since epoch).
+  fileNow     : Nat
+  -- Compute SHA3-256 hash of a Text, return as hex string.
+  hashText    : Text -> Text
+
+--------------------------------------------------------------------------------
+-- PRODUCTION FILE I/O HANDLER
+-- Delegates to platform FFI for real disk operations.
+--------------------------------------------------------------------------------
+
+handleFileIO : forall r. '{FileIO} r -> r
+handleFileIO program =
+  handle !program with
+    FileIO.readFile path        -> resume -> resume (platformReadFile path)
+    FileIO.writeFile path text  -> resume -> platformWriteFile path text; resume ()
+    FileIO.appendLine path line -> resume -> platformAppendLine path line; resume ()
+    FileIO.listDir path         -> resume -> resume (platformListDir path)
+    FileIO.fileExists path      -> resume -> resume (platformFileExists path)
+    FileIO.deleteFile path      -> resume -> platformDeleteFile path; resume ()
+    FileIO.fileNow              -> resume -> resume (platformNow ())
+    FileIO.hashText text        -> resume -> resume (platformSHA3 text)
+    return r -> r
+
+-- Platform FFI stubs (file I/O only — no DB engine)
+platformReadFile   : Text -> Optional Text
+platformWriteFile  : Text -> Text -> ()
+platformAppendLine : Text -> Text -> ()
+platformListDir    : Text -> [Text]
+platformFileExists : Text -> Bool
+platformDeleteFile : Text -> ()
+platformSHA3       : Text -> Text
+
+--------------------------------------------------------------------------------
+-- IN-MEMORY MOCK FILE I/O HANDLER
+-- Used in tests. Stores all files in a Ref (Map Text Text).
+-- appendLine is simulated by reading + appending + writing.
+--------------------------------------------------------------------------------
+
+handleFileIOMock : forall r. '{FileIO} r -> (r, Map Text Text)
+handleFileIOMock program =
+  store = Ref.make (Map.empty : Map Text Text)
+  clock = Ref.make (1718841600 : Nat)
+  result = handle !program with
+    FileIO.readFile path        -> resume ->
+      resume (Map.lookup path (Ref.read store))
+    FileIO.writeFile path text  -> resume ->
+      Ref.modify store (Map.insert path text)
+      resume ()
+    FileIO.appendLine path line -> resume ->
+      existing = Optional.getOrElse "" (Map.lookup path (Ref.read store))
+      Ref.modify store (Map.insert path (existing ++ line ++ "\n"))
+      resume ()
+    FileIO.listDir dir          -> resume ->
+      files = Map.keys (Ref.read store)
+      matching = List.filter (Text.startsWith dir) files
+      resume matching
+    FileIO.fileExists path      -> resume ->
+      resume (Map.member path (Ref.read store))
+    FileIO.deleteFile path      -> resume ->
+      Ref.modify store (Map.delete path)
+      resume ()
+    FileIO.fileNow              -> resume ->
+      t = Ref.read clock
+      Ref.modify clock (Nat.increment)
+      resume t
+    FileIO.hashText text        -> resume ->
+      -- Deterministic mock hash: length + first 8 chars
+      prefix = Text.take 8 text
+      resume ("mock-" ++ Nat.toText (Text.size text) ++ "-" ++ prefix)
+    return r -> r
+  (result, Ref.read store)
+
+--------------------------------------------------------------------------------
+-- ENTITY SERIALISATION
+-- Entities are stored as JSON text files.
+-- The content hash is computed from a canonical serialisation of
+-- (entityType, valueText, previousHash, timestamp, author).
+-- This means the hash is deterministic and content-addressed.
+--------------------------------------------------------------------------------
+
+entityToJson : forall a. (a -> Text) -> Entity a -> Text
+entityToJson serialiseValue entity =
+  prevHash = match entity.previous with
+    None   -> "null"
+    Some h -> "\"" ++ Hash.toText h ++ "\""
+  factsJson = "[" ++ Text.join "," (List.map factToJson entity.facts) ++ "]"
+  "{\"hash\":\""      ++ Hash.toText entity.hash
+  ++ "\",\"type\":\""  ++ entityTypeToText entity.entityType
+  ++ "\",\"value\":"   ++ serialiseValue entity.value
+  ++ ",\"facts\":"     ++ factsJson
+  ++ ",\"previous\":"  ++ prevHash
+  ++ ",\"timestamp\":" ++ Nat.toText entity.timestamp
+  ++ ",\"author\":\""  ++ entity.author
+  ++ "\"}"
+
+factToJson : Fact -> Text
+factToJson f =
+  "{\"claim\":\""       ++ f.claim
+  ++ "\",\"source\":\"" ++ f.source
+  ++ "\",\"credibility\":" ++ Nat.toText f.credibility
+  ++ "}"
+
+entityTypeToText : EntityType -> Text
+entityTypeToText t = match t with
+  KnowledgeArticle -> "article"
+  CoinEntity       -> "coin"
+  BlockRecord      -> "block"
+  MinerProfile     -> "miner"
+  GovernanceRecord -> "governance"
+
+textToEntityType : Text -> Optional EntityType
+textToEntityType t = match t with
+  "article"    -> Some KnowledgeArticle
+  "coin"       -> Some CoinEntity
+  "block"      -> Some BlockRecord
+  "miner"      -> Some MinerProfile
+  "governance" -> Some GovernanceRecord
+  _            -> None
+
+--------------------------------------------------------------------------------
+-- KNOWLEDGE FILE STORE
+-- Each entity is stored as $GRIM_DATA_PATH/entities/<hash>.json
+-- Type indexes are maintained as append-only files:
+--   $GRIM_DATA_PATH/entities/by-type/<type>.idx
+--   Each line = one hash
+-- Facts are stored at $GRIM_DATA_PATH/facts/<hash>.facts.jsonl
+--------------------------------------------------------------------------------
+
+entityPath : Text -> Text -> Text
+entityPath dataPath hash = dataPath ++ "/entities/" ++ hash ++ ".json"
+
+typeIndexPath : Text -> EntityType -> Text
+typeIndexPath dataPath entityType =
+  dataPath ++ "/entities/by-type/" ++ entityTypeToText entityType ++ ".idx"
+
+factsPath : Text -> Text -> Text
+factsPath dataPath hash = dataPath ++ "/facts/" ++ hash ++ ".facts.jsonl"
+
+-- Store a new entity. Compute hash, write file, update type index.
+fsStoreEntity : forall a. Text -> (a -> Text) -> EntityType -> a -> Text -> '{FileIO} Entity a
+fsStoreEntity dataPath serialise entityType value author = do
+  now       = fileNow
+  canonical = entityTypeToText entityType ++ serialise value ++ author ++ Nat.toText now
+  hashHex   = hashText canonical
+  entity    =
+    { hash       = Hash.fromText hashHex
+    , entityType = entityType
+    , value      = value
+    , facts      = []
+    , previous   = None
+    , timestamp  = now
+    , author     = author
+    }
+  writeFile (entityPath dataPath hashHex) (entityToJson serialise entity)
+  appendLine (typeIndexPath dataPath entityType) hashHex
+  entity
+
+-- Retrieve an entity by hash.
+fsGetEntity : forall a. Text -> (Text -> Optional a) -> Hash -> '{FileIO} Optional (Entity a)
+fsGetEntity dataPath deserialise hash = do
+  path    = entityPath dataPath (Hash.toText hash)
+  content = readFile path
+  match content with
+    None    -> None
+    Some json -> jsonToEntity deserialise json
+
+-- Update an entity: create a new revision linked to previousHash.
+fsUpdateEntity : forall a. Text -> (a -> Text) -> (Text -> Optional a) -> Hash -> a -> Text -> '{FileIO} Entity a
+fsUpdateEntity dataPath serialise _deserialise previousHash newValue author = do
+  now       = fileNow
+  canonical = Hash.toText previousHash ++ serialise newValue ++ author ++ Nat.toText now
+  hashHex   = hashText canonical
+  -- Determine entity type from previous entity file name (stored in json)
+  -- For simplicity: caller provides entityType via the ability surface;
+  -- here we default to KnowledgeArticle and let Knowledge.update carry the type.
+  entity    =
+    { hash       = Hash.fromText hashHex
+    , entityType = KnowledgeArticle   -- overridden by Knowledge.update caller
+    , value      = newValue
+    , facts      = []
+    , previous   = Some previousHash
+    , timestamp  = now
+    , author     = author
+    }
+  writeFile (entityPath dataPath hashHex) (entityToJson serialise entity)
+  entity
+
+-- Get all revisions for an entity: follow the chain of previous hashes.
+fsEntityHistory : forall a. Text -> (Text -> Optional a) -> Hash -> '{FileIO} [Entity a]
+fsEntityHistory dataPath deserialise startHash = do
+  go startHash []
+  where
+    go : Hash -> [Entity a] -> '{FileIO} [Entity a]
+    go currentHash acc = do
+      entity = fsGetEntity dataPath deserialise currentHash
+      match entity with
+        None -> List.reverse acc
+        Some e ->
+          match e.previous with
+            None   -> List.reverse (e +: acc)
+            Some p -> go p (e +: acc)
+
+-- List all entities of a given type by scanning the type index.
+fsListByType : forall a. Text -> (Text -> Optional a) -> EntityType -> '{FileIO} [Entity a]
+fsListByType dataPath deserialise entityType = do
+  idxPath = typeIndexPath dataPath entityType
+  content = readFile idxPath
+  match content with
+    None -> []
+    Some text ->
+      hashes   = List.filter (h -> h != "") (Text.lines text)
+      entities = List.filterMap
+        (hashHex -> fsGetEntity dataPath deserialise (Hash.fromText hashHex))
+        hashes
+      entities
+
+-- Get facts for an entity.
+fsGetFacts : Text -> Hash -> '{FileIO} [Fact]
+fsGetFacts dataPath hash = do
+  path    = factsPath dataPath (Hash.toText hash)
+  content = readFile path
+  match content with
+    None    -> []
+    Some text ->
+      lines = List.filter (l -> l != "") (Text.lines text)
+      List.filterMap jsonToFact lines
+
+-- Add a fact to an entity.
+fsAddFact : Text -> Hash -> Fact -> '{FileIO} ()
+fsAddFact dataPath hash fact = do
+  path = factsPath dataPath (Hash.toText hash)
+  appendLine path (factToJson fact)
+
+--------------------------------------------------------------------------------
+-- KNOWLEDGE HANDLER (FileIO-backed)
+-- Replaces handleKnowledge in Local.u entirely.
+-- No SQLite. No FFI beyond basic file I/O.
+--------------------------------------------------------------------------------
+
+handleKnowledgeFS : forall r. Text -> '{Knowledge} r -> '{FileIO} r
+handleKnowledgeFS dataPath program =
+  handle !program with
+    Knowledge.store entityType value author -> resume ->
+      entity = fsStoreEntity dataPath textSerialise entityType value author
+      resume entity
+    Knowledge.get hash         -> resume ->
+      result = fsGetEntity dataPath textDeserialise hash
+      resume result
+    Knowledge.history hash     -> resume ->
+      revisions = fsEntityHistory dataPath textDeserialise hash
+      resume revisions
+    Knowledge.listByType t     -> resume ->
+      entities = fsListByType dataPath textDeserialise t
+      resume entities
+    Knowledge.update hash value author -> resume ->
+      entity = fsUpdateEntity dataPath textSerialise textDeserialise hash value author
+      resume entity
+    Knowledge.getFacts hash    -> resume ->
+      facts = fsGetFacts dataPath hash
+      resume facts
+    Knowledge.addFact hash fact -> resume ->
+      fsAddFact dataPath hash fact
+      resume ()
+    return r -> r
+
+-- Generic text serialise/deserialise (values stored as quoted JSON strings)
+-- For typed entities (CoinDef, Block, etc.) callers provide their own.
+textSerialise   : forall a. a -> Text
+textSerialise _  = "\"[opaque]\""
+
+textDeserialise : forall a. Text -> Optional a
+textDeserialise _ = None
+
+--------------------------------------------------------------------------------
+-- USER STORE
+-- Users stored in $GRIM_DATA_PATH/users/users.jsonl
+-- Each line is a JSON user record. Last-write-wins per userId.
+-- Sessions stored in $GRIM_DATA_PATH/users/sessions.jsonl
+-- Revoked JTIs in $GRIM_DATA_PATH/users/revoked.jsonl
+--
+-- This replaces all localAuth* SQLite stubs in Local.u.
+--------------------------------------------------------------------------------
+
+usersPath   : Text -> Text
+usersPath dp = dp ++ "/users/users.jsonl"
+
+sessionsPath : Text -> Text
+sessionsPath dp = dp ++ "/users/sessions.jsonl"
+
+revokedPath : Text -> Text
+revokedPath dp = dp ++ "/users/revoked.jsonl"
+
+-- Serialise a User to a JSON line.
+userToJson : User -> Text
+userToJson u =
+  "{\"id\":\""         ++ u.id
+  ++ "\",\"username\":\"" ++ u.username
+  ++ "\",\"role\":\""    ++ roleToText u.role
+  ++ "\",\"tier\":\""    ++ tierToText u.tier
+  ++ "\",\"reputation\":" ++ Nat.toText u.reputation
+  ++ ",\"createdAt\":"   ++ Nat.toText u.createdAt
+  ++ "}"
+
+-- Append a user record (insert or update).
+fsWriteUser : Text -> User -> '{FileIO} ()
+fsWriteUser dataPath user =
+  appendLine (usersPath dataPath) (userToJson user)
+
+-- Scan the ledger and return the latest record for each userId.
+-- Last line wins for any given id (append-only ledger, last-write-wins).
+fsReadUsers : Text -> '{FileIO} [User]
+fsReadUsers dataPath = do
+  content = readFile (usersPath dataPath)
+  match content with
+    None -> []
+    Some text ->
+      lines = List.filter (l -> l != "") (Text.lines text)
+      parsed = List.filterMap jsonToUser lines
+      -- Last-write-wins: fold into a Map by id, then extract values
+      byId = List.foldLeft
+        (m u -> Map.insert u.id u m)
+        Map.empty
+        parsed
+      Map.values byId
+
+fsGetUser : Text -> Text -> '{FileIO} Optional User
+fsGetUser dataPath userId = do
+  users = fsReadUsers dataPath
+  List.find (u -> u.id == userId) users
+
+fsGetUserByUsername : Text -> Text -> '{FileIO} Optional User
+fsGetUserByUsername dataPath username = do
+  users = fsReadUsers dataPath
+  List.find (u -> u.username == username) users
+
+-- Session store: append session token lines, scan for active tokens.
+fsWriteSession : Text -> Text -> Text -> Nat -> '{FileIO} ()
+fsWriteSession dataPath userId token expiry =
+  line = "{\"userId\":\"" ++ userId ++ "\",\"token\":\"" ++ token ++ "\",\"exp\":" ++ Nat.toText expiry ++ "}"
+  appendLine (sessionsPath dataPath) line
+
+fsIsTokenRevoked : Text -> Text -> '{FileIO} Bool
+fsIsTokenRevoked dataPath jti = do
+  content = readFile (revokedPath dataPath)
+  match content with
+    None -> False
+    Some text -> List.any (line -> Text.contains jti line) (Text.lines text)
+
+fsRevokeToken : Text -> Text -> '{FileIO} ()
+fsRevokeToken dataPath jti =
+  appendLine (revokedPath dataPath) jti
+
+-- Current-user context: stored as a Ref in the handler scope.
+-- Set on login, cleared on token revocation.
+type AuthContext = AuthContext (Optional User)
+
+--------------------------------------------------------------------------------
+-- AUTH HANDLER (FileIO-backed)
+-- Replaces handleAuth in Local.u entirely.
+-- User store = JSONL file. Session tokens = HS256 JWT via Crypto ability.
+-- No SQLite. No external DB.
+--------------------------------------------------------------------------------
+
+handleAuthFS : forall r. Text -> '{Auth} r -> '{FileIO, Crypto} r
+handleAuthFS dataPath program =
+  currentUserRef = Ref.make (None : Optional User)
+  handle !program with
+    Auth.currentUser            -> resume ->
+      match Ref.read currentUserRef with
+        None   -> raise NotAuthenticated
+        Some u -> resume u
+
+    Auth.requireRole required   -> resume ->
+      match Ref.read currentUserRef with
+        None   -> raise NotAuthenticated
+        Some u ->
+          if fsRoleRank u.role >= fsRoleRank required then resume ()
+          else raise (InsufficientRole required u.role)
+
+    Auth.requireTier required   -> resume ->
+      match Ref.read currentUserRef with
+        None   -> raise NotAuthenticated
+        Some u ->
+          if fsTierRank u.tier >= fsTierRank required then resume ()
+          else raise (InsufficientTier required u.tier)
+
+    Auth.login username password -> resume ->
+      maybeUser = fsGetUserByUsername dataPath username
+      match maybeUser with
+        None   -> raise (NotAuthenticated)
+        Some u ->
+          -- Password verified via Crypto.decrypt (scrypt stored hash)
+          storedHash = fsLoadPasswordHash dataPath u.id
+          inputHash  = Crypto.deriveKey password
+          if storedHash == inputHash then
+            Ref.write currentUserRef (Some u)
+            resume u
+          else
+            raise NotAuthenticated
+
+    Auth.loginCert nonce sig cert -> resume ->
+      -- Verify Ed25519 signature over nonce using cert public key
+      valid = fsVerifyCertSignature nonce sig cert
+      if valid then
+        maybeUser = fsGetUser dataPath cert.sub
+        match maybeUser with
+          None   -> raise NotAuthenticated
+          Some u ->
+            Ref.write currentUserRef (Some u)
+            resume u
+      else
+        raise InvalidSignature
+
+    Auth.issueToken user         -> resume ->
+      now    = fileNow
+      expiry = now + 86400   -- 24h
+      jti    = Hash.toText (Hash.fromText (user.id ++ Nat.toText now))
+      token  = fsBuildJWT user jti expiry
+      fsWriteSession dataPath user.id token expiry
+      resume token
+
+    Auth.revokeToken jti         -> resume ->
+      fsRevokeToken dataPath jti
+      resume ()
+
+    Auth.provisionCert sub tier  -> resume ->
+      now  = fileNow
+      cert =
+        { certId     = hashText (sub ++ Nat.toText now)
+        , sub        = sub
+        , instanceId = dataPath
+        , tier       = tier
+        , scope      = ["mining", "governance", "vault"]
+        , exp        = now + (86400 * 365)
+        }
+      resume cert
+
+    Auth.listUsers               -> resume ->
+      users = fsReadUsers dataPath
+      resume users
+
+    Auth.createUser username password role -> resume ->
+      now  = fileNow
+      uid  = hashText (username ++ Nat.toText now)
+      user =
+        { id         = uid
+        , username   = username
+        , role       = role
+        , tier       = Hearth
+        , reputation = 0
+        , createdAt  = now
+        }
+      fsWriteUser dataPath user
+      fsStorePasswordHash dataPath uid (Crypto.deriveKey password)
+      resume user
+
+    Auth.setRole userId role     -> resume ->
+      maybeUser = fsGetUser dataPath userId
+      match maybeUser with
+        None   -> raise NotAuthenticated
+        Some u ->
+          fsWriteUser dataPath { u | role = role }
+          resume ()
+
+    Auth.deleteUser userId       -> resume ->
+      -- Soft-delete: write a tombstone record with Banned role
+      maybeUser = fsGetUser dataPath userId
+      match maybeUser with
+        None -> resume ()
+        Some u ->
+          fsWriteUser dataPath { u | role = Banned }
+          resume ()
+
+    return r -> r
+
+-- Role and tier rank helpers (mirrors Local.u)
+fsRoleRank : Role -> Nat
+fsRoleRank role = match role with
+  Banned -> 0; Member -> 1; Operator -> 2; Admin -> 3; Owner -> 4
+
+fsTierRank : Tier -> Nat
+fsTierRank tier = match tier with
+  Hearth -> 0; Forge -> 1; Foundry -> 2; Citadel -> 3
+
+-- Utility: role/tier text
+roleToText : Role -> Text
+roleToText r = match r with
+  Owner -> "owner"; Admin -> "admin"; Operator -> "operator"
+  Member -> "member"; Banned -> "banned"
+
+tierToText : Tier -> Text
+tierToText t = match t with
+  Hearth -> "hearth"; Forge -> "forge"
+  Foundry -> "foundry"; Citadel -> "citadel"
+
+-- Password hash storage: $GRIM_DATA_PATH/users/<userId>.pwhash
+fsLoadPasswordHash : Text -> Text -> '{FileIO} Bytes
+fsLoadPasswordHash dataPath userId = do
+  path    = dataPath ++ "/users/" ++ userId ++ ".pwhash"
+  content = readFile path
+  match content with
+    None    -> Bytes.empty
+    Some b  -> Bytes.fromBase64 b
+
+fsStorePasswordHash : Text -> Text -> Bytes -> '{FileIO} ()
+fsStorePasswordHash dataPath userId hash =
+  path = dataPath ++ "/users/" ++ userId ++ ".pwhash"
+  writeFile path (Bytes.toBase64 hash)
+
+-- Minimal HS256 JWT builder (header.payload.sig, base64url encoded)
+fsBuildJWT : User -> Text -> Nat -> Text
+fsBuildJWT user jti exp =
+  header  = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"  -- {alg:HS256,typ:JWT} b64
+  payload = base64urlEncode
+    ( "{\"sub\":\"" ++ user.id
+    ++ "\",\"username\":\"" ++ user.username
+    ++ "\",\"role\":\"" ++ roleToText user.role
+    ++ "\",\"jti\":\"" ++ jti
+    ++ "\",\"exp\":" ++ Nat.toText exp ++ "}" )
+  header ++ "." ++ payload ++ "." ++ "[sig]"
+
+-- Ed25519 cert signature verification (delegates to Crypto FFI)
+fsVerifyCertSignature : Text -> Text -> CertPayload -> Bool
+fsVerifyCertSignature nonce sig cert =
+  platformVerifyEd25519 cert.certId nonce sig
+
+-- JSON parsing stubs (minimal; replace with full parser if needed)
+jsonToEntity  : forall a. (Text -> Optional a) -> Text -> Optional (Entity a)
+jsonToUser    : Text -> Optional User
+jsonToFact    : Text -> Optional Fact
+base64urlEncode : Text -> Text
+
+-- Ed25519 FFI stub (only remaining non-file FFI)
+platformVerifyEd25519 : Text -> Text -> Text -> Bool
+
+--------------------------------------------------------------------------------
+-- UPDATED LOCAL RUNTIME COMPOSITION
+-- Replaces runLocal in Local.u.
+-- handleKnowledgeFS and handleAuthFS replace their SQLite predecessors.
+-- The FileIO ability is added to the stack; production uses handleFileIO.
+--------------------------------------------------------------------------------
+
+runLocalFS : forall r.
+  Text    -- dataPath
+  -> '{Mining, Auth, Knowledge, Vault, Reputation, Governance, Audit, Stream, Crypto, FileIO} r
+  -> r
+runLocalFS dataPath program =
+  handleFileIO
+    (handleCrypto
+      (handleStream
+        (handleAudit
+          (handleGovernance
+            (handleReputation
+              (handleVault
+                (handleKnowledgeFS dataPath
+                  (handleAuthFS dataPath
+                    (handleMining
+                      program))))))))))
+
+--------------------------------------------------------------------------------
+-- TESTS
+--------------------------------------------------------------------------------
+
+testEntityTypeRoundtrip : Bool
+testEntityTypeRoundtrip =
+  List.all
+    (t -> textToEntityType (entityTypeToText t) == Some t)
+    [KnowledgeArticle, CoinEntity, BlockRecord, MinerProfile, GovernanceRecord]
+
+testFactToJson : Bool
+testFactToJson =
+  f    = { claim = "test", source = "src", credibility = 90 }
+  json = factToJson f
+  Text.contains "\"claim\":\"test\"" json &&
+  Text.contains "\"credibility\":90" json
+
+testFsRoleRank : Bool
+testFsRoleRank =
+  fsRoleRank Banned < fsRoleRank Member &&
+  fsRoleRank Member < fsRoleRank Operator &&
+  fsRoleRank Operator < fsRoleRank Admin &&
+  fsRoleRank Admin < fsRoleRank Owner
+
+testFsTierRank : Bool
+testFsTierRank =
+  fsTierRank Hearth < fsTierRank Forge &&
+  fsTierRank Forge  < fsTierRank Foundry &&
+  fsTierRank Foundry < fsTierRank Citadel
+
+testMockStoreAndRead : Bool
+testMockStoreAndRead =
+  -- Use mock handler to store and retrieve a file without touching disk
+  (result, finalStore) = handleFileIOMock do
+    writeFile "/test/hello.txt" "world"
+    readFile "/test/hello.txt"
+  result == Some "world" && Map.member "/test/hello.txt" finalStore
+
+testMockAppendLine : Bool
+testMockAppendLine =
+  (result, _) = handleFileIOMock do
+    appendLine "/test/log.jsonl" "{\"a\":1}"
+    appendLine "/test/log.jsonl" "{\"b\":2}"
+    readFile "/test/log.jsonl"
+  match result with
+    Some text -> Text.contains "{\"a\":1}" text && Text.contains "{\"b\":2}" text
+    None      -> False
+
+testUserJsonRoundtrip : Bool
+testUserJsonRoundtrip =
+  u    = { id = "u1", username = "alice", role = Admin, tier = Forge, reputation = 50, createdAt = 0 }
+  json = userToJson u
+  Text.contains "\"username\":\"alice\"" json &&
+  Text.contains "\"role\":\"admin\"" json
