@@ -4,52 +4,35 @@
 
 ## Session: 2026-06-19 (continued)
 
-### Grim.Knowledge — COMPLETE
+### Grim.Handlers.Local — COMPLETE
 
-File: `Grim/Knowledge.u`
-Commit: `f6282113b4d8cc983a9fcc728d2233791aacf974`
+File: `Grim/Handlers/Local.u`  
+Commit: `9879199d5000f8f8ea9768c0b8d9cae15bb1b181`
 
-| Function | Description |
+| Handler | Strategy |
 |---|---|
-| `knowledgeStore` | Guarded write — Forge tier minimum, stores value as content-addressed entity, audit-logged |
-| `knowledgeUpdate` | Guarded revision — creates new entity linked to previous hash, audit-logged |
-| `knowledgeGet` | Open read — retrieves entity by content hash, access audit-logged |
-| `knowledgeHistory` | Full revision chain for an entity hash, oldest to newest |
-| `knowledgeAddFact` | Forge tier — attaches a credibility-scored Fact claim to an entity |
-| `knowledgeGetFacts` | Open read — returns all facts on an entity |
-| `knowledgeListCoins` | All CoinEntity entities — canonical coin config source |
-| `knowledgeListBlocks` | All BlockRecord entities |
-| `knowledgeListMiners` | All MinerProfile entities |
-| `knowledgeListArticles` | All KnowledgeArticle entities |
-| `knowledgeListGovernanceRecords` | All GovernanceRecord entities |
-| `verifyEntityChain` | Walks full revision chain and verifies every `previous` hash link |
-| `syncCoinToKnowledge` | Called by Pool on coin register/update — upserts CoinDef as Knowledge entity |
-| `storeBlockEntity` | Called by Pool.blockLoop — stores Block as provenance-chained entity |
-| `entityTypeToText` | Utility — EntityType → Text for audit metadata |
+| `handleMining` | Stratum V1 TCP shim via HTTP relay. Shim (Node.js/Go) speaks raw Stratum, normalises Share/Block into JSON, POSTs to Grim's local HTTP listener. All mining logic stays in Grim. FFI stubs: `grimShimReceive*`, `grimShimGetHashrate`, etc. |
+| `handleAuth` | Local Ed25519 keypair for cert login. scrypt for password hashing. HS256 JWT for session tokens. User store in local SQLite. FFI stubs: `localAuthLogin`, `localAuthProvisionCert`, `localAuthIssueToken`, etc. |
+| `handleKnowledge` | SQLite via FFI. Each entity stored as JSON row `(hash, entity_type, value JSON, facts JSON, previous_hash, timestamp, author)`. Content hash computed from all fields. FFI stubs: `sqliteStoreEntity`, `sqliteGetEntity`, `sqliteEntityHistory`, etc. |
+| `handleVault` | AES-256-GCM local encrypted store via FFI. Master key derived via scrypt KDF. Each VaultEntry carries `previousHash` for provenance chain. Path: `$GRIM_VAULT_PATH`. FFI stubs: `localVaultStore`, `localVaultGet`, `localVaultRotate`, etc. |
+| `handleReputation` | Local flat-file JSONL score ledger at `$GRIM_DATA_PATH/reputation.jsonl`. `syncRole`/`syncTier` call `reputationToRole`/`tierFromReputation` (pure Math), then update SQLite Auth store. FFI stubs: `localRepGetScore`, `localRepApplyDelta`, etc. |
+| `handleGovernance` | Local config-file store at `$GRIM_DATA_PATH/governance.json`. Mode changes written atomically (write-then-rename). FFI stubs: `localGovGetMode`, `localGovSetMode`, `localGovCheckAccess`, `localGovGetHistory`. |
+| `handleAudit` | Append-only JSONL chain at `$GRIM_DATA_PATH/audit.jsonl`. Each entry hashes its predecessor for tamper-evidence. `verifyChain` walks the full file. FFI stubs: `localAuditAppend`, `localAuditRecent`, `localAuditVerifyChain`, etc. |
+| `handleStream` | WebSocket broadcast server on `$GRIM_STREAM_PORT` (default 3334). MagoFonte stream module model. Events serialised as `{ type, payload, timestamp }` JSON. All subscribers receive all events; filtering is client-side. FFI stub: `wsEmit`. |
+| `handleCrypto` | AES-256-GCM + scrypt + Ed25519 via platform FFI. Used by Vault and Auth. Cloud handler substitutes Unison Cloud KMS. FFI stubs: `aesGcmEncrypt`, `aesGcmDecrypt`, `scryptDeriveKey`, `platformRandomBytes`. |
 
----
-
-### Grim.Governance — COMPLETE
-
-File: `Grim/Governance.u`
-Commit: `f6282113b4d8cc983a9fcc728d2233791aacf974`
-
-| Function | Description |
-|---|---|
-| `guardedAction` | Primary access gate — wraps `canPerformAction` (pure) with Auth/Audit, aborts on deny |
-| `transitionMode` | Auth-gated mode switch — validates with `canTransitionMode`, persists to Knowledge, broadcasts, audits |
-| `reputationSync` | Collapses grimoire Loop 3 — recalculates role/tier from score, broadcasts rep change |
-| `governanceHistory` | Returns all GovernanceRecord entities from Knowledge store |
-| `canAct` | Soft access check — returns Bool, used by dashboard/UI layers |
-| `verifyGovernanceAudit` | Admin-gated — verifies full audit chain integrity |
-| `GovernanceRecord` type | Stored on every mode transition — replaces dir plugin-dir-governance records |
-| `modeToText`, `actionToText`, `roleToText`, `tierToText` | Text utilities for audit metadata and streaming |
+#### `runLocal` — Handler Composition
+```
+runLocal : '{Mining, Auth, Knowledge, Vault, Reputation, Governance, Audit, Stream, Crypto} r -> r
+```
+Stacks all nine handlers in a single call. The UCM entry point calls `runLocal do proofLoop` and the self-hosted Grim is fully operational. No ability is left unhandled.
 
 #### Design Notes
-- `canPerformAction` and `canTransitionMode` remain in `Grim.Math` — pure, zero effects
-- `guardedAction` is the single replacement for all of grimoire’s Loop 3 governance bridge logic
-- `GovernanceRecord` entities form a provenance-chained ledger inside the Knowledge store
-- `reputationSync` is called after every reputation delta — no polling, no grimoire sidecar
+- Every handler is a pure Unison function — the FFI boundary is declared via stubs, not inline native code
+- The Stratum TCP shim is the **only** process with a TCP socket; Grim never owns a raw socket
+- SQLite is shared between `handleKnowledge` and `handleAuth` (same DB file, separate tables)
+- `handleReputation.syncRole` calls `localAuthSetRole` directly — the only cross-handler call; this is intentional and documented
+- Audit entries are written **after** every effect in Pool, Knowledge, Governance, and Vault — nothing mutates state silently
 
 ---
 
@@ -64,45 +47,53 @@ Commit: `f6282113b4d8cc983a9fcc728d2233791aacf974`
 | Grim.Pool | ✅ Complete |
 | Grim.Knowledge | ✅ Complete |
 | Grim.Governance | ✅ Complete |
-| Grim.Handlers.Local | 📋 Next |
-| Grim.Handlers.Cloud | 📋 Planned |
+| Grim.Handlers.Local | ✅ Complete |
+| Grim.Handlers.Cloud | 📋 Next |
 
 ---
 
 ### Open Design Questions
 
-1. **Stratum TCP shim** — thin native shim speaking Stratum V1 TCP, calling into Grim via HTTP. Design not yet written.
+1. **Stratum TCP shim language** — Node.js (mirrors MagoFonte codebase) vs Go (lighter binary). Decision needed before shim implementation.
 2. **Browser cert flow** — confirmed: thin vanilla JS shell calling Grim HTTP endpoints.
 3. **NocoBase frontend** — decision pending: retain as read layer or replace.
+4. **SQLite FFI library** — which Unison FFI wrapper to use for SQLite (community package vs custom).
 
 ---
 
 ### Next Steps
-- [ ] Write Grim.Handlers.Local — UCM self-hosted handler implementations
 - [ ] Write Grim.Handlers.Cloud — Unison Cloud / Lancia handler implementations
-- [ ] Design Stratum TCP shim
+- [ ] Decide Stratum TCP shim language (Node.js vs Go)
 - [ ] Confirm NocoBase frontend decision
+- [ ] Confirm SQLite FFI library choice
+
+---
+
+## Session: 2026-06-19 (Grim.Knowledge + Grim.Governance)
+
+### Grim.Knowledge — COMPLETE
+File: `Grim/Knowledge.u` | Commit: `f6282113`
+- `knowledgeStore`, `knowledgeUpdate`, `knowledgeGet`, `knowledgeHistory`
+- `knowledgeAddFact`, `knowledgeGetFacts`
+- `knowledgeListCoins/Blocks/Miners/Articles/GovernanceRecords`
+- `verifyEntityChain` — walks and validates full revision chain
+- `syncCoinToKnowledge`, `storeBlockEntity`
+
+### Grim.Governance — COMPLETE
+File: `Grim/Governance.u` | Commit: `f6282113`
+- `guardedAction` — single replacement for all of grimoire Loop 3
+- `transitionMode`, `reputationSync`, `governanceHistory`, `canAct`
+- `verifyGovernanceAudit`, `GovernanceRecord` type
 
 ---
 
 ## Session: 2026-06-19 (Grim.Pool)
 
 ### Grim.Pool — COMPLETE
-
-File: `Grim/GrimPool.u`  
-Commit: `3501c9e5077288aad82ec00fffe3b794db43cd6e`
-
-| Function | Description |
-|---|---|
-| `proofLoop` | Hot path — receives shares, applies `miningDelta`, records to Audit, broadcasts to Stream |
-| `blockLoop` | Concurrent — receives found blocks, applies `blockDelta`, stores block as Knowledge entity, triggers payout |
-| `computePayouts` | Pure PPLNS — splits block reward proportionally using `Math.pplns` |
-| `applyPayouts` | Audit-logs every payment issued |
-| `adjustDifficulty` | Per-miner VarDiff using `Math.vardiff` and `targetShareInterval = 15s` |
-| `poolSummary` | Live snapshot of active sessions, total hashrate, active coins |
-| `registerCoinGuarded` | Register a new coin — Operator role required, audit-logged |
-| `startNodeGuarded` / `stopNodeGuarded` | Node control — Admin role required, audit-logged |
-| `nodeMonitorLoop` | Per-coin continuous loop — detects NodeStatus changes, streams and audits |
+File: `Grim/GrimPool.u` | Commit: `3501c9e5`
+- `proofLoop`, `blockLoop`, `computePayouts`, `applyPayouts`
+- `adjustDifficulty`, `poolSummary`
+- `registerCoinGuarded`, `startNodeGuarded`, `stopNodeGuarded`, `nodeMonitorLoop`
 
 ---
 
