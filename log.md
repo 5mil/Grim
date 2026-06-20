@@ -4,127 +4,110 @@
 
 ## Session: 2026-06-19 (continued)
 
+### Grim.Handlers.Cloud — COMPLETE
+
+File: [`Grim/Handlers/Cloud.u`](https://github.com/5mil/Grim/blob/main/Grim/Handlers/Cloud.u)  
+Commit: `10b8d453f4d4d9fb2732a75df4e367f4b703c185`
+
+Full Unison Cloud handler file. Every ability in `Grim.Abilities` is satisfied by a cloud handler. `runCloud` composition is structurally identical to `runLocal` — same 9-handler stack, same order, different implementations.
+
+#### Handler Correspondence
+
+| Ability | Local handler | Cloud handler | Key difference |
+|---|---|---|---|
+| Mining | `grimShim*` FFI (Stratum TCP) | `cloudPool*` HTTP gateway | Cloud gateway normalises Stratum; no local TCP |
+| Auth | `localAuth*` + SQLite + local Ed25519 key | `cloudAuth*` + KMS JWT | Key material never leaves cloud HSM |
+| Knowledge | `sqlite*` FFI (JSON rows) | `cloudKv*` entity store | Cloud KV owns replication and history |
+| Vault | `localVault*` AES-256-GCM file | `cloudKmsVault*` KMS secrets | No local AES key, no local encrypted file |
+| Reputation | `localRep*` flat-file JSONL | `cloudRep*` cloud KV | Consistent across nodes; no flat-file sync |
+| Governance | `localGov*` config-file | `cloudGov*` cloud KV + event bus | `setMode` emits to all nodes immediately |
+| Audit | `localAudit*` JSONL chain | `cloudAudit*` cloud service | `verifyChain` delegates to server-side walk |
+| Stream | `wsEmit` WebSocket (single process) | `cloudEventEmit` event bus | Fanout across all cloud nodes |
+| Crypto | `aesGcmEncrypt*` platform FFI | `cloudKms*` KMS API | No raw key in process memory |
+
+#### Security upgrade: KMS boundary
+
+In `Local.u`, key material (AES keys, Ed25519 private keys) is derived locally via `scryptDeriveKey` / platform FFI and lives briefly in process memory. In `Cloud.u` all key operations route through the cloud KMS (`cloudKmsEncrypt`, `cloudKmsSignJWT`, `cloudKmsProvisionCert`). The Grim process never holds raw key material. This is the Lancia security model applied uniformly across all nine abilities.
+
+#### Governance side effect
+
+`handleGovernanceCloud.setMode` has one addition over `handleGovernanceLocal`: after persisting the new mode it calls `cloudEventEmit "governance"` to propagate the change to all nodes via the event bus. The local handler writes to a config file and relies on the single process reading it. The cloud handler broadcasts immediately, keeping distributed nodes consistent without polling.
+
+---
+
 ### unison-filestore — EXTRACTED AS STANDALONE LIBRARY
 
 Repo: [github.com/5mil/unison-filestore](https://github.com/5mil/unison-filestore)  
 Version: `0.1.0`  
 License: MIT
 
-The `FileIO` ability and all entity/user store functions from `Grim/Store/FileStore.u` have been extracted into a standalone Unison library. The internal `Grim/Store/FileStore.u` remains as the Grim-specific integration layer; the library is the reusable, application-agnostic core.
+The `FileIO` ability and all entity/user store functions extracted as a standalone Unison library. Zero dependency on Grim types or abilities. Can be dropped into any Unison application needing a content-addressed file store without an external DB engine.
 
 #### Additions over `Grim/Store/FileStore.u`
 
-| Area | Internal (`Grim/Store/FileStore.u`) | Standalone (`unison-filestore`) |
-|---|---|---|
-| `EntityType` | 5 fixed variants | 5 fixed + `CustomEntity Text` escape hatch for any application |
-| `textToEntityType` | 5 cases | 6 cases: handles `custom:<name>` prefix round-trip |
-| `Entity` / `Fact` / `Hash` | Imported from `Grim.Types` | Self-contained type definitions in the library itself |
-| `Role` / `Tier` / `User` | Imported from `Grim.Types` | Self-contained type definitions (library has no Grim dependency) |
-| `fsUpdateEntity` | Takes unused `_deserialise` param | Signature cleaned: `Text -> (a -> Text) -> Hash -> a -> Text -> '{FileIO} Entity a` |
-| Path helpers | Inline strings | Named: `entityFilePath`, `typeIndexPath`, `factsFilePath`, `usersFilePath`, `sessionsFilePath`, `revokedFilePath`, `pwhashFilePath` |
-| Tests | 7 tests | 11 tests: adds `testCustomEntityType`, `testMockFileExists`, `testMockDelete`, `testMockHashDeterministic` |
-| Docs | None | `README.md`, `USAGE.md`, `WHITEPAPER.md` |
-| `handleAuthFS` | Present (Grim-specific, uses `Grim.Abilities.Auth`) | Not included — Auth is application-specific; library provides the user store primitives only (`fsReadUsers`, `fsWriteUser`, `fsGetUser`, `fsRevokeToken`, etc.) |
-| `handleKnowledgeFS` | Present (Grim-specific, uses `Grim.Abilities.Knowledge`) | Not included — Knowledge ability is Grim-specific; library provides store operations only |
-
-**Net:** the library is `FileIO` ability + entity store + user store + JSON serialisation + 11 tests, with zero dependency on Grim types or abilities. It can be dropped into any Unison application that needs a content-addressed file store without an external DB engine.
-
-#### Why no `handleAuthFS` / `handleKnowledgeFS` in the library
-
-Those two handlers depend on `Grim.Abilities.Auth` and `Grim.Abilities.Knowledge` — both of which are Grim-specific algebraic effects. Extracting them would pull the entire Grim ability surface into the library. The correct boundary is: the library owns the *storage primitives* (`fsStoreEntity`, `fsReadUsers`, etc.); Grim owns the *ability handlers* that call those primitives. This separation means the library has no Grim dependency and can be versioned independently.
+| Area | Delta |
+|---|---|
+| `EntityType` | `CustomEntity Text` variant added |
+| `textToEntityType` | `custom:<name>` prefix round-trip handled |
+| `Entity` / `User` / `Role` / `Tier` | Self-contained — zero Grim dependency |
+| `fsUpdateEntity` | Unused `_deserialise` param removed |
+| Path helpers | All promoted to named functions |
+| Tests | 7 → 11 (adds `testCustomEntityType`, `testMockFileExists`, `testMockDelete`, `testMockHashDeterministic`) |
+| Docs | `README.md`, `USAGE.md`, `WHITEPAPER.md` |
+| `handleAuthFS` / `handleKnowledgeFS` | Excluded — depend on Grim-specific abilities; library owns storage primitives only |
 
 ---
 
 ### Grim.Store.FileStore — COMPLETE
-### SQLite dependency — ELIMINATED
 
-File: `Grim/Store/FileStore.u`  
-Commit: `d25b5d0ed895640c3f02baba6dd01bf7e4ba0ccb`
-
-The entire Knowledge and Auth persistence layer is Unison-native. No SQLite. No ORM. No external DB engine.
-
-#### Storage Layout
-```
-$GRIM_DATA_PATH/
-  entities/
-    <hash>.json              ← one file per entity revision (content-addressed)
-    by-type/<type>.idx       ← append-only hash index per EntityType
-  users/
-    users.jsonl              ← user ledger (last-write-wins per userId)
-    sessions.jsonl           ← issued session tokens
-    revoked.jsonl            ← revoked JTIs
-    <userId>.pwhash          ← base64 scrypt hash per user
-  facts/
-    <hash>.facts.jsonl       ← facts per entity hash
-```
-
-#### Complete FFI surface — entire self-hosted deployment
-
-| FFI stub | Purpose |
-|---|---|
-| `platformReadFile` / `platformWriteFile` / `platformAppendLine` / `platformListDir` / `platformFileExists` / `platformDeleteFile` | File I/O |
-| `platformNow` | Wall-clock timestamp |
-| `platformSHA3` | SHA3-256 hash |
-| `platformVerifyEd25519` | Cert signature verification |
-| `aesGcmEncrypt` / `aesGcmDecrypt` / `scryptDeriveKey` / `platformRandomBytes` | Vault + Auth crypto |
-| `tcpAccept` / `tcpReadLine` / `tcpWriteLine` / `tcpClose` | Stratum TCP socket |
-| `platformUUID` | Session ID generation |
-| `rpcGetBlockHeight` / `rpcGetBlockHash` | Coin node RPC polling |
-| `platformSleepMs` | Shim monitor loop |
-| `wsEmit` | WebSocket broadcast |
-
-No DB engine anywhere in this list.
+File: `Grim/Store/FileStore.u` | Commit: `d25b5d0e`  
+Entire Knowledge + Auth persistence layer. Unison-native. Zero SQLite. Zero ORM.
 
 ---
 
 ### Grim.Shim.Stratum — COMPLETE
 
-File: `Grim/Shim/Stratum.u`  
-Commit: `83a64a1232ee0ec0a5db442c96623ede78965c09`
-
-Full Stratum V1 TCP shim in Unison. Pure parser + dispatcher, `StratumSocket` ability (swappable for tests), `ShimQueues` ability bridging TCP to `handleMining`, `shimNodeMonitor` block detector, `runShim` composition.
+File: `Grim/Shim/Stratum.u` | Commit: `83a64a12`  
+Full Stratum V1 TCP shim in Unison. Pure parser + dispatcher, `StratumSocket` ability (swappable for tests), `ShimQueues` bridge, `shimNodeMonitor`, `runShim` composition.
 
 ---
 
-### Current Module Status
+## ✅ ALL MODULES COMPLETE
 
-| Module | Status |
-|---|---|
-| Grim.Types | ✅ Complete |
-| Grim.Math | ✅ Complete |
-| Grim.Abilities | ✅ Complete |
-| Grim.Vault | ✅ Complete |
-| Grim.Pool | ✅ Complete |
-| Grim.Knowledge | ✅ Complete |
-| Grim.Governance | ✅ Complete |
-| Grim.Handlers.Local | ✅ Complete |
-| Grim.Store.FileStore | ✅ Complete |
-| Grim.Shim.Stratum | ✅ Complete |
-| Grim.Handlers.Cloud | 📋 Next |
-
-### Open Design Questions
-1. **Browser cert flow** — confirmed: thin vanilla JS shell calling Grim HTTP endpoints.
-2. **NocoBase frontend** — decision pending: retain as read layer or replace.
-3. **ShimQueues spin-poll** — replace with UCM Channel/Scope when available (handler swap only).
+| Module | Status | Commit |
+|---|---|---|
+| Grim.Types | ✅ | initial |
+| Grim.Math | ✅ | initial |
+| Grim.Abilities | ✅ | initial |
+| Grim.Vault | ✅ | initial |
+| Grim.Pool | ✅ | `3501c9e5` |
+| Grim.Knowledge | ✅ | `f6282113` |
+| Grim.Governance | ✅ | `f6282113` |
+| Grim.Handlers.Local | ✅ | `9879199d` |
+| Grim.Store.FileStore | ✅ | `d25b5d0e` |
+| Grim.Shim.Stratum | ✅ | `83a64a12` |
+| Grim.Handlers.Cloud | ✅ | `10b8d453` |
 
 ---
 
-### Next Steps
-- [ ] Write `Grim.Handlers.Cloud`
-- [ ] Confirm NocoBase frontend decision
-- [ ] Replace ShimQueues spin-poll with UCM Channel/Scope primitives
+## Open Design Questions (unresolved)
+
+1. **Browser cert flow** — confirmed: thin vanilla JS shell calling Grim HTTP endpoints. No work needed in this codebase.
+2. **NocoBase frontend** — decision pending: retain as read layer or replace with Unison-served interface.
+3. **ShimQueues spin-poll** — replace with UCM `Channel`/`Scope` when available. Handler swap only; no logic change.
 
 ---
 
-## Previous Sessions (summary)
+## Remaining Work
 
-| Module | Commit |
-|---|---|
-| Grim.Shim.Stratum | `83a64a12` |
-| Grim.Store.FileStore | `d25b5d0e` |
-| Grim.Handlers.Local | `9879199d` |
-| Grim.Knowledge + Grim.Governance | `f6282113` |
-| Grim.Pool | `3501c9e5` |
+- [ ] Resolve NocoBase frontend decision
+- [ ] Replace `ShimQueues` spin-poll with UCM `Channel`/`Scope`
+- [ ] Implement the 20 platform FFI stubs (native shim layer, outside Unison)
+- [ ] Wire `runLocal` / `runCloud` to a UCM `main` entry point
+- [ ] Browser cert UI (thin vanilla JS, calls Grim HTTP endpoints)
 
-### Core Finding
-Grim is the system. One codebase. One language. The deployment profile is determined by which ability handlers are provided at runtime.
+---
+
+## Architecture Summary
+
+Grim is the system. One content-addressed Unison codebase. The pure logic — `wikiTrust`, `canPerformAction`, `proofLoop`, `guardedAction` — is identical in both deployments. The deployment profile (`LocalSelfHosted` vs `CloudLancia`) is determined entirely by which handler stack (`runLocal` vs `runCloud`) is provided at runtime. No parallel codebases. No bridge. No translation layer.
