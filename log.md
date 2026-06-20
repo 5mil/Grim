@@ -4,73 +4,65 @@
 
 ## Session: 2026-06-19 (continued)
 
+### unison-filestore — EXTRACTED AS STANDALONE LIBRARY
+
+Repo: [github.com/5mil/unison-filestore](https://github.com/5mil/unison-filestore)  
+Version: `0.1.0`  
+License: MIT
+
+The `FileIO` ability and all entity/user store functions from `Grim/Store/FileStore.u` have been extracted into a standalone Unison library. The internal `Grim/Store/FileStore.u` remains as the Grim-specific integration layer; the library is the reusable, application-agnostic core.
+
+#### Additions over `Grim/Store/FileStore.u`
+
+| Area | Internal (`Grim/Store/FileStore.u`) | Standalone (`unison-filestore`) |
+|---|---|---|
+| `EntityType` | 5 fixed variants | 5 fixed + `CustomEntity Text` escape hatch for any application |
+| `textToEntityType` | 5 cases | 6 cases: handles `custom:<name>` prefix round-trip |
+| `Entity` / `Fact` / `Hash` | Imported from `Grim.Types` | Self-contained type definitions in the library itself |
+| `Role` / `Tier` / `User` | Imported from `Grim.Types` | Self-contained type definitions (library has no Grim dependency) |
+| `fsUpdateEntity` | Takes unused `_deserialise` param | Signature cleaned: `Text -> (a -> Text) -> Hash -> a -> Text -> '{FileIO} Entity a` |
+| Path helpers | Inline strings | Named: `entityFilePath`, `typeIndexPath`, `factsFilePath`, `usersFilePath`, `sessionsFilePath`, `revokedFilePath`, `pwhashFilePath` |
+| Tests | 7 tests | 11 tests: adds `testCustomEntityType`, `testMockFileExists`, `testMockDelete`, `testMockHashDeterministic` |
+| Docs | None | `README.md`, `USAGE.md`, `WHITEPAPER.md` |
+| `handleAuthFS` | Present (Grim-specific, uses `Grim.Abilities.Auth`) | Not included — Auth is application-specific; library provides the user store primitives only (`fsReadUsers`, `fsWriteUser`, `fsGetUser`, `fsRevokeToken`, etc.) |
+| `handleKnowledgeFS` | Present (Grim-specific, uses `Grim.Abilities.Knowledge`) | Not included — Knowledge ability is Grim-specific; library provides store operations only |
+
+**Net:** the library is `FileIO` ability + entity store + user store + JSON serialisation + 11 tests, with zero dependency on Grim types or abilities. It can be dropped into any Unison application that needs a content-addressed file store without an external DB engine.
+
+#### Why no `handleAuthFS` / `handleKnowledgeFS` in the library
+
+Those two handlers depend on `Grim.Abilities.Auth` and `Grim.Abilities.Knowledge` — both of which are Grim-specific algebraic effects. Extracting them would pull the entire Grim ability surface into the library. The correct boundary is: the library owns the *storage primitives* (`fsStoreEntity`, `fsReadUsers`, etc.); Grim owns the *ability handlers* that call those primitives. This separation means the library has no Grim dependency and can be versioned independently.
+
+---
+
 ### Grim.Store.FileStore — COMPLETE
 ### SQLite dependency — ELIMINATED
 
 File: `Grim/Store/FileStore.u`  
 Commit: `d25b5d0ed895640c3f02baba6dd01bf7e4ba0ccb`
 
-**Decision:** SQLite FFI library question closed. No external DB. No FFI beyond file I/O and two crypto primitives. Zero-dependency self-hosted deployment.
-
-#### What Was Replaced
-
-| Was (Local.u SQLite stubs) | Now (FileStore.u Unison) |
-|---|---|
-| `sqliteStoreEntity` | `fsStoreEntity` — writes `<hash>.json` file |
-| `sqliteGetEntity` | `fsGetEntity` — reads `<hash>.json` file |
-| `sqliteEntityHistory` | `fsEntityHistory` — follows `previous` hash chain |
-| `sqliteListByType` | `fsListByType` — scans `by-type/<type>.idx` append-only index |
-| `sqliteUpdateEntity` | `fsUpdateEntity` — creates new hash-linked revision file |
-| `sqliteGetFacts` | `fsGetFacts` — reads `<hash>.facts.jsonl` |
-| `sqliteAddFact` | `fsAddFact` — appends to `<hash>.facts.jsonl` |
-| `localAuthGetCurrentUser` | `Ref`-based current-user context in `handleAuthFS` |
-| `localAuthLogin` | `fsGetUserByUsername` + scrypt hash compare |
-| `localAuthListUsers` | `fsReadUsers` — scans `users.jsonl`, last-write-wins per id |
-| `localAuthCreateUser` | `fsWriteUser` + `fsStorePasswordHash` |
-| `localAuthSetRole` | `fsWriteUser` with updated role (append to ledger) |
-| `localAuthDeleteUser` | Soft-delete: append Banned tombstone to ledger |
+The entire Knowledge and Auth persistence layer is Unison-native. No SQLite. No ORM. No external DB engine.
 
 #### Storage Layout
 ```
 $GRIM_DATA_PATH/
   entities/
-    <hash>.json              ← one file per entity revision
+    <hash>.json              ← one file per entity revision (content-addressed)
     by-type/<type>.idx       ← append-only hash index per EntityType
   users/
-    users.jsonl              ← append-only user ledger (last-write-wins)
-    sessions.jsonl           ← active session tokens
+    users.jsonl              ← user ledger (last-write-wins per userId)
+    sessions.jsonl           ← issued session tokens
     revoked.jsonl            ← revoked JTIs
-    <userId>.pwhash          ← base64-encoded scrypt hash per user
+    <userId>.pwhash          ← base64 scrypt hash per user
   facts/
-    <hash>.facts.jsonl       ← facts appended per entity hash
+    <hash>.facts.jsonl       ← facts per entity hash
 ```
 
-#### `FileIO` Ability — the key architectural move
+#### Complete FFI surface — entire self-hosted deployment
 
-All file I/O is declared as a single swappable ability:
-
-| Operation | Description |
+| FFI stub | Purpose |
 |---|---|
-| `readFile` | Returns `Optional Text` (None if absent) |
-| `writeFile` | Atomic write (write-then-rename in production) |
-| `appendLine` | Append a JSONL line (creates file if absent) |
-| `listDir` | List filenames in a directory |
-| `fileExists` | Bool existence check |
-| `deleteFile` | No-op if absent |
-| `fileNow` | Wall-clock timestamp (Nat, seconds since epoch) |
-| `hashText` | SHA3-256 of a Text, returns hex string |
-
-Two handlers:
-- **`handleFileIO`** — production, 8 platform FFI stubs (file I/O only)
-- **`handleFileIOMock`** — tests, `Ref (Map Text Text)`, no disk access
-
-With `handleFileIOMock`, `handleKnowledgeFS` and `handleAuthFS` are **fully testable without a disk, a database, or a running process.**
-
-#### Remaining FFI surface (entire self-hosted deployment)
-
-| Stub | Purpose |
-|---|---|
-| `platformReadFile` / `platformWriteFile` / `platformAppendLine` / `platformListDir` / `platformFileExists` / `platformDeleteFile` | Basic file I/O |
+| `platformReadFile` / `platformWriteFile` / `platformAppendLine` / `platformListDir` / `platformFileExists` / `platformDeleteFile` | File I/O |
 | `platformNow` | Wall-clock timestamp |
 | `platformSHA3` | SHA3-256 hash |
 | `platformVerifyEd25519` | Cert signature verification |
@@ -78,18 +70,19 @@ With `handleFileIOMock`, `handleKnowledgeFS` and `handleAuthFS` are **fully test
 | `tcpAccept` / `tcpReadLine` / `tcpWriteLine` / `tcpClose` | Stratum TCP socket |
 | `platformUUID` | Session ID generation |
 | `rpcGetBlockHeight` / `rpcGetBlockHash` | Coin node RPC polling |
-| `platformSleepMs` | Shim node monitor loop |
+| `platformSleepMs` | Shim monitor loop |
 | `wsEmit` | WebSocket broadcast |
 
-This is the **complete FFI boundary** for the entire self-hosted Grim deployment. No DB engine. No ORM. No external process except the WebSocket server and coin nodes.
+No DB engine anywhere in this list.
 
-#### Tests (7)
-- `testEntityTypeRoundtrip` — all 5 entity types serialise and parse back correctly
-- `testFactToJson` — fact JSON serialisation
-- `testFsRoleRank` / `testFsTierRank` — rank ordering
-- `testMockStoreAndRead` — write then read a file using mock handler
-- `testMockAppendLine` — two appends produce correct JSONL
-- `testUserJsonRoundtrip` — user serialises to JSON with correct fields
+---
+
+### Grim.Shim.Stratum — COMPLETE
+
+File: `Grim/Shim/Stratum.u`  
+Commit: `83a64a1232ee0ec0a5db442c96623ede78965c09`
+
+Full Stratum V1 TCP shim in Unison. Pure parser + dispatcher, `StratumSocket` ability (swappable for tests), `ShimQueues` ability bridging TCP to `handleMining`, `shimNodeMonitor` block detector, `runShim` composition.
 
 ---
 
@@ -117,7 +110,7 @@ This is the **complete FFI boundary** for the entire self-hosted Grim deployment
 ---
 
 ### Next Steps
-- [ ] Write Grim.Handlers.Cloud
+- [ ] Write `Grim.Handlers.Cloud`
 - [ ] Confirm NocoBase frontend decision
 - [ ] Replace ShimQueues spin-poll with UCM Channel/Scope primitives
 
@@ -128,6 +121,7 @@ This is the **complete FFI boundary** for the entire self-hosted Grim deployment
 | Module | Commit |
 |---|---|
 | Grim.Shim.Stratum | `83a64a12` |
+| Grim.Store.FileStore | `d25b5d0e` |
 | Grim.Handlers.Local | `9879199d` |
 | Grim.Knowledge + Grim.Governance | `f6282113` |
 | Grim.Pool | `3501c9e5` |
