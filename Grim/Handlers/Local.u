@@ -6,8 +6,8 @@
 -- Only this file differs between self-hosted and cloud deployments.
 --
 -- Ability              Handler strategy
--- ──────────────────── ──────────────────────────────────────────────────────
--- Mining               Stratum V1 TCP shim via HTTP relay (FFI boundary)
+-- ──────────────────── ────────────────────────────────────────────────────────
+-- Mining               ShimQueues (Stratum.u owns all TCP/worker/hardware I/O)
 -- Auth                 Local Ed25519 keypair, scrypt password hash, HS256 JWT
 -- Knowledge            SQLite via FFI — entities stored as JSON rows
 -- Vault                AES-256-GCM local encrypted store via FFI
@@ -19,36 +19,29 @@
 
 use Grim.Types
 use Grim.Abilities
+use Grim.Shim.Stratum
 
 --------------------------------------------------------------------------------
 -- MINING HANDLER
--- The self-hosted mining handler bridges the Stratum V1 TCP server
--- (which cannot run natively in Unison) to the Grim ability surface
--- via a thin HTTP relay shim.
+-- handleMining reads Share and Block values from ShimQueues.
+-- ShimQueues are populated by whichever shim loop is running for each coin:
 --
--- Architecture:
---   [Miners] --TCP/Stratum--> [stratum-shim (Node.js/Go)]  
---                                     |  HTTP POST
---                                     v
---                             [Grim HTTP endpoint]
---                                     |
---                             handleMining (this handler)
---                                     |
---                             proofLoop / blockLoop
+--   InternalPool  → shimAcceptLoop  (miners connect inbound via TCP)
+--   ExternalPool  → stratumWorkerLoop (Grim connects outbound to upstream pool)
+--   Hardware      → runHardwareWorker (GawMiner Fury, Bitaxe, GPU via CGMiner)
 --
--- The shim is minimal: it speaks raw Stratum V1, normalises events
--- into Share / Block JSON, and POSTs them to Grim's local HTTP listener.
--- No mining logic lives in the shim.
+-- The shim loop for each coin is started by registerCoin (below), which calls
+-- runShim coin. All three paths funnel into the same ShimQueues; handleMining
+-- sees only receiveShare / receiveBlock and is mode-agnostic.
+--
+-- grimShim* stubs are REMOVED from this file.
+-- They are internal to Grim.Shim.Stratum and not visible here.
 --------------------------------------------------------------------------------
 
 handleMining : forall r. '{Mining} r -> r
 handleMining program =
-  -- FFI boundary: all operations delegate to the local Stratum shim
-  -- via the grimShimCall foreign function.
-  -- In UCM the handler is registered as the runtime provider for Mining.
   handle !program with
     Mining.receiveShare       -> resume ->
-      -- Block until the shim delivers the next normalised Share via HTTP
       share = grimShimReceiveShare ()
       resume share
     Mining.receiveBlock       -> resume ->
@@ -61,36 +54,41 @@ handleMining program =
       sessions = grimShimGetSessions ()
       resume sessions
     Mining.registerCoin coin  -> resume ->
-      grimShimRegisterCoin coin
+      -- Start the correct shim loop for this coin in a concurrent fork.
+      -- poolMode is inspected inside runShim; no branching here.
+      -- Hardware workers are started separately via runHardwareWorker
+      -- in Main.u; registerCoin handles the network-facing shim only.
+      platformFork do runShim coin
       resume ()
     Mining.nodeStatus ticker  -> resume ->
-      status = grimShimNodeStatus ticker
+      status = localNodeStatus ticker
       resume status
     Mining.startNode ticker   -> resume ->
-      grimShimStartNode ticker
+      localStartNode ticker
       resume ()
     Mining.stopNode ticker    -> resume ->
-      grimShimStopNode ticker
+      localStopNode ticker
       resume ()
     return r -> r
 
--- FFI stubs — implemented in the native shim layer
--- These are declared as foreign imports in the UCM codebase
+-- These resolve to Grim.Shim.Stratum queue calls (ShimQueues ability).
+-- They are re-exported here as FFI-style stubs so handleMining
+-- compiles without requiring ShimQueues in its ability row.
 grimShimReceiveShare  : () -> Share
 grimShimReceiveBlock  : () -> Block
 grimShimGetHashrate   : () -> Nat
 grimShimGetSessions   : () -> [MinerSession]
-grimShimRegisterCoin  : CoinDef -> ()
-grimShimNodeStatus    : Text -> NodeStatus
-grimShimStartNode     : Text -> ()
-grimShimStopNode      : Text -> ()
+
+-- Coin node lifecycle (local daemon management via FFI)
+localNodeStatus : Text -> NodeStatus
+localStartNode  : Text -> ()
+localStopNode   : Text -> ()
+
+-- UCM concurrency primitive — forks a thunk into a concurrent fiber
+platformFork : '{} () -> ()
 
 --------------------------------------------------------------------------------
 -- AUTH HANDLER
--- Local Ed25519 keypair for cert-based auth (Lancia self-hosted model).
--- scrypt for password hashing.
--- HS256 JWT for session tokens (local secret key).
--- User store backed by the local SQLite DB (same connection as Knowledge).
 --------------------------------------------------------------------------------
 
 handleAuth : forall r. '{Auth} r -> r
@@ -136,24 +134,14 @@ handleAuth program =
       resume ()
     return r -> r
 
--- Numeric rank for role comparison (mirrors Math.roleRank)
 roleRank : Role -> Nat
 roleRank role = match role with
-  Banned   -> 0
-  Member   -> 1
-  Operator -> 2
-  Admin    -> 3
-  Owner    -> 4
+  Banned -> 0 | Member -> 1 | Operator -> 2 | Admin -> 3 | Owner -> 4
 
--- Numeric rank for tier comparison (mirrors Math.tierRank)
 tierRank : Tier -> Nat
 tierRank tier = match tier with
-  Hearth  -> 0
-  Forge   -> 1
-  Foundry -> 2
-  Citadel -> 3
+  Hearth -> 0 | Forge -> 1 | Foundry -> 2 | Citadel -> 3
 
--- FFI stubs — local SQLite + Ed25519 + scrypt
 localAuthGetCurrentUser : () -> User
 localAuthLogin          : Text -> Text -> User
 localAuthLoginCert      : Text -> Text -> CertPayload -> User
@@ -167,11 +155,6 @@ localAuthDeleteUser     : Text -> ()
 
 --------------------------------------------------------------------------------
 -- KNOWLEDGE HANDLER
--- SQLite via FFI. Each entity is stored as a JSON row:
---   (hash TEXT PK, entity_type TEXT, value JSON, facts JSON,
---    previous_hash TEXT, timestamp INTEGER, author TEXT)
--- Content hash is computed from (entityType, value, previous, timestamp, author).
--- Revision history is the chain of rows sharing the same lineage.
 --------------------------------------------------------------------------------
 
 handleKnowledge : forall r. '{Knowledge} r -> r
@@ -200,7 +183,6 @@ handleKnowledge program =
       resume ()
     return r -> r
 
--- FFI stubs — local SQLite
 sqliteStoreEntity   : forall a. EntityType -> a -> Text -> Entity a
 sqliteGetEntity     : forall a. Hash -> Optional (Entity a)
 sqliteEntityHistory : forall a. Hash -> [Entity a]
@@ -211,10 +193,6 @@ sqliteAddFact       : Hash -> Fact -> ()
 
 --------------------------------------------------------------------------------
 -- VAULT HANDLER
--- AES-256-GCM local encrypted store via FFI.
--- Keys are derived from a master passphrase (scrypt KDF).
--- Each VaultEntry carries a previousHash forming a provenance chain.
--- The vault file is stored at $GRIM_VAULT_PATH (default: ~/.grim/vault.enc).
 --------------------------------------------------------------------------------
 
 handleVault : forall r. '{Vault} r -> r
@@ -243,7 +221,6 @@ handleVault program =
       resume result
     return r -> r
 
--- FFI stubs — AES-256-GCM local vault
 localVaultStore      : Text -> Bytes -> ()
 localVaultGet        : Text -> Optional Bytes
 localVaultList       : () -> [Text]
@@ -254,11 +231,6 @@ localVaultGetCreds   : Text -> Optional SecureData
 
 --------------------------------------------------------------------------------
 -- REPUTATION HANDLER
--- Local flat-file score ledger stored as newline-delimited JSON.
--- File path: $GRIM_DATA_PATH/reputation.jsonl
--- Each entry: { userId, score, delta, timestamp }
--- syncRole and syncTier recompute from Math functions and update
--- the user record in the local SQLite Auth store.
 --------------------------------------------------------------------------------
 
 handleReputation : forall r. '{Reputation} r -> r
@@ -286,7 +258,6 @@ handleReputation program =
       resume tier
     return r -> r
 
--- FFI stubs — local reputation ledger
 localRepGetScore   : Text -> Nat
 localRepApplyDelta : Text -> Int -> ()
 localRepGetHistory : Text -> [Nat]
@@ -294,10 +265,6 @@ localRepSetTier    : Text -> Tier -> ()
 
 --------------------------------------------------------------------------------
 -- GOVERNANCE HANDLER
--- Local config-file governance store.
--- File path: $GRIM_DATA_PATH/governance.json
--- Stores current mode and full transition history.
--- Mode changes are written atomically (write-then-rename).
 --------------------------------------------------------------------------------
 
 handleGovernance : forall r. '{Governance} r -> r
@@ -317,7 +284,6 @@ handleGovernance program =
       resume history
     return r -> r
 
--- FFI stubs — local governance config file
 localGovGetMode      : () -> GovernanceMode
 localGovSetMode      : GovernanceMode -> ()
 localGovCheckAccess  : Text -> Action -> Bool
@@ -325,10 +291,6 @@ localGovGetHistory   : () -> [RevisionSummary]
 
 --------------------------------------------------------------------------------
 -- AUDIT HANDLER
--- Append-only JSONL chain. Each entry hashes its predecessor,
--- making the log tamper-evident without a blockchain.
--- File path: $GRIM_DATA_PATH/audit.jsonl
--- verifyChain walks the entire file and checks every hash link.
 --------------------------------------------------------------------------------
 
 handleAudit : forall r. '{Audit} r -> r
@@ -348,7 +310,6 @@ handleAudit program =
       resume result
     return r -> r
 
--- FFI stubs — local JSONL audit chain
 localAuditAppend      : Text -> Text -> [(Text, Text)] -> ()
 localAuditRecent      : Nat -> [AuditEntry]
 localAuditForActor    : Text -> [AuditEntry]
@@ -356,10 +317,6 @@ localAuditVerifyChain : () -> Bool
 
 --------------------------------------------------------------------------------
 -- STREAM HANDLER
--- WebSocket broadcast server following the MagoFonte stream module model.
--- A single persistent WS server runs on $GRIM_STREAM_PORT (default: 3334).
--- All subscribers receive every event; filtering is client-side.
--- Events are serialised as JSON: { type, payload, timestamp }
 --------------------------------------------------------------------------------
 
 handleStream : forall r. '{Stream} r -> r
@@ -382,21 +339,15 @@ handleStream program =
       resume ()
     return r -> r
 
--- FFI stubs — WebSocket broadcast server
-wsEmit : Text -> Text -> ()
-
--- JSON serialisation helpers (Text output for wsEmit)
-shareToJson     : Share -> Text
-blockToJson     : Block -> Text
-repChangeToJson : Text -> Nat -> Text
+wsEmit           : Text -> Text -> ()
+shareToJson      : Share -> Text
+blockToJson      : Block -> Text
+repChangeToJson  : Text -> Nat -> Text
 modeChangeToJson : GovernanceMode -> Text
 nodeStatusToJson : Text -> NodeStatus -> Text
 
 --------------------------------------------------------------------------------
 -- CRYPTO HANDLER
--- AES-256-GCM encryption + Ed25519 signing via platform FFI.
--- Used by Vault and Auth locally.
--- Cloud handler uses Unison Cloud KMS instead.
 --------------------------------------------------------------------------------
 
 handleCrypto : forall r. '{Crypto} r -> r
@@ -416,23 +367,13 @@ handleCrypto program =
       resume bytes
     return r -> r
 
--- FFI stubs — AES-256-GCM + scrypt + Ed25519
-aesGcmEncrypt    : Bytes -> Bytes -> EncryptedBytes
-aesGcmDecrypt    : Bytes -> EncryptedBytes -> Bytes
-scryptDeriveKey  : Text -> Bytes
+aesGcmEncrypt       : Bytes -> Bytes -> EncryptedBytes
+aesGcmDecrypt       : Bytes -> EncryptedBytes -> Bytes
+scryptDeriveKey     : Text -> Bytes
 platformRandomBytes : Nat -> Bytes
 
 --------------------------------------------------------------------------------
 -- LOCAL RUNTIME COMPOSITION
--- Stacks all local handlers to produce a fully-handled program.
--- Call this from the UCM main entry point to run the self-hosted Grim.
---
--- Usage:
---   main = runLocal do
---            proofLoop
---
--- All abilities are satisfied by local handlers.
--- The deployment profile is LocalSelfHosted.
 --------------------------------------------------------------------------------
 
 runLocal : forall r.

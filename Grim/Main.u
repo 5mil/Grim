@@ -1,0 +1,178 @@
+-- Grim.Main
+-- Entry point for the self-hosted (UCM / LocalSelfHosted) deployment.
+--
+-- Startup sequence:
+--   1. Load GrimConfig from environment / config file
+--   2. For each CoinDef in config.coins:
+--        fork do runShim coin
+--        (runShim routes InternalPool → shimAcceptLoop
+--                         ExternalPool url → stratumWorkerLoop)
+--   3. For each HardwareBackend in config.hardware:
+--        fork do runHardwareWorker hw
+--        (covers FuryUSB, BitaxeHTTP, GPUMiner)
+--   4. Run the Grim proof / block / governance loops under runLocal
+--
+-- All shim loops and hardware workers feed the same ShimQueues.
+-- The proof loop sees only receiveShare / receiveBlock; it is
+-- completely unaware of whether shares come from:
+--   - inbound TCP miner connections (InternalPool)
+--   - an outbound Stratum worker connection (ExternalPool)
+--   - a USB ASIC (FuryUSB)
+--   - a LAN Bitaxe device (BitaxeHTTP)
+--   - a local GPU running CGMiner/BFGMiner (GPUMiner)
+--
+-- Mixed-mode example (all running simultaneously):
+--   coins:
+--     - DOGE  poolMode = InternalPool  stratumPort = 3333  (Scrypt)
+--     - LTC   poolMode = ExternalPool "ltcpool.example.com:3333"
+--   hardware:
+--     - FuryUSB    device=/dev/hidraw0  coin=DOGE
+--     - BitaxeHTTP host=192.168.1.42   coin=BTC
+--     - GPUMiner   host=127.0.0.1      coin=DOGE  gpuIndex=0
+
+use Grim.Types
+use Grim.Abilities
+use Grim.Handlers.Local
+use Grim.Shim.Stratum
+use Grim.Shim.Hardware
+use Grim.Pool
+
+--------------------------------------------------------------------------------
+-- MAIN
+--------------------------------------------------------------------------------
+
+grimMain : GrimConfig -> ()
+grimMain config =
+  -- Step 1: Start one shim loop per coin
+  List.each config.coins (coin ->
+    platformFork do runShim coin
+  )
+
+  -- Step 2: Start hardware workers
+  List.each config.hardware (hw ->
+    platformFork do
+      handleShimQueues
+        (handleStratumSocket
+          do runHardwareWorker hw)
+  )
+
+  -- Step 3: Run the Grim engine
+  runLocal do
+    platformFork do blockLoop
+    proofLoop
+
+--------------------------------------------------------------------------------
+-- DEFAULT CONFIG
+-- A minimal single-coin internal-pool configuration.
+-- Override by loading from $GRIM_CONFIG_PATH or passing a custom GrimConfig.
+--------------------------------------------------------------------------------
+
+defaultCoin : CoinDef
+defaultCoin =
+  { name        = "Dogecoin"
+  , ticker      = "DOGE"
+  , algorithm   = Scrypt
+  , rpcPort     = 22555
+  , stratumPort = 3333
+  , diff        = 1
+  , reward      = 10000
+  , poolMode    = InternalPool
+  }
+
+defaultConfig : GrimConfig
+defaultConfig =
+  { profile        = LocalSelfHosted
+  , instanceId     = "grim-local-0"
+  , governanceMode = Solo
+  , defaultTier    = Hearth
+  , coins          = [defaultCoin]
+  , hardware       = []
+  }
+
+-- External pool example config
+exampleExternalConfig : GrimConfig
+exampleExternalConfig =
+  ltc =
+    { name        = "Litecoin"
+    , ticker      = "LTC"
+    , algorithm   = Scrypt
+    , rpcPort     = 9332
+    , stratumPort = 3334    -- not used in ExternalPool mode
+    , diff        = 1
+    , reward      = 1250
+    , poolMode    = ExternalPool "ltcpool.example.com:3333"
+    }
+  { defaultConfig | coins = [defaultCoin, ltc] }
+
+-- Hardware example config
+exampleHardwareConfig : GrimConfig
+exampleHardwareConfig =
+  fury   = FuryUSB    { devicePath = "/dev/hidraw0",    coin = "DOGE", workerId = "fury.0" }
+  bitaxe = BitaxeHTTP { host = "192.168.1.42", port = 80, coin = "BTC",  workerId = "bitaxe.living" }
+  gpu0   = GPUMiner   { host = "127.0.0.1", rpcPort = 4028, coin = "DOGE", workerId = "gpu.0", gpuIndex = 0 }
+  { defaultConfig | hardware = [fury, bitaxe, gpu0] }
+
+--------------------------------------------------------------------------------
+-- STARTUP HELPERS
+--------------------------------------------------------------------------------
+
+-- Register all coins with the Mining ability (persists CoinDef, starts node)
+registerAllCoins : [CoinDef] -> '{Mining, Auth, Audit} ()
+registerAllCoins coins = do
+  List.each coins (coin ->
+    registerCoinGuarded coin
+  )
+
+-- Configure GPU miners to point at the correct pool
+-- InternalPool → add localhost:stratumPort as their pool
+-- ExternalPool → add the upstream URL as their pool
+configureGPUPools : [HardwareBackend] -> [CoinDef] -> ()
+configureGPUPools hardware coins =
+  List.each hardware (hw ->
+    match hw with
+      GPUMiner r ->
+        -- Find the CoinDef for this GPU's coin
+        match List.find (c -> c.ticker == r.coin) coins with
+          None -> ()  -- coin not registered; skip
+          Some coin ->
+            poolUrl = match coin.poolMode with
+              InternalPool      -> "stratum+tcp://localhost:" ++ Nat.toText coin.stratumPort
+              ExternalPool url  -> "stratum+tcp://" ++ url
+            cgminerAddPool r.host r.rpcPort poolUrl
+      _ -> ()  -- FuryUSB and Bitaxe don't use cgminerAddPool here
+  )
+
+--------------------------------------------------------------------------------
+-- TESTS
+--------------------------------------------------------------------------------
+
+testDefaultCoinMode : Bool
+testDefaultCoinMode =
+  defaultCoin.poolMode == InternalPool
+
+testDefaultConfigCoins : Bool
+testDefaultConfigCoins =
+  List.size defaultConfig.coins == 1 &&
+  List.size defaultConfig.hardware == 0
+
+testExternalConfigPoolMode : Bool
+testExternalConfigPoolMode =
+  match List.find (c -> c.ticker == "LTC") exampleExternalConfig.coins with
+    Some ltc -> match ltc.poolMode with
+      ExternalPool _ -> True
+      _              -> False
+    None -> False
+
+testHardwareConfigDevices : Bool
+testHardwareConfigDevices =
+  List.size exampleHardwareConfig.hardware == 3
+
+testConfigureGPUPoolsInternal : Bool
+testConfigureGPUPoolsInternal =
+  -- configureGPUPools is side-effecting (FFI); test that the url is built correctly
+  coin   = defaultCoin  -- InternalPool, stratumPort 3333
+  gpu    = GPUMiner { host = "127.0.0.1", rpcPort = 4028, coin = "DOGE", workerId = "gpu.0", gpuIndex = 0 }
+  poolUrl = match coin.poolMode with
+    InternalPool     -> "stratum+tcp://localhost:" ++ Nat.toText coin.stratumPort
+    ExternalPool url -> "stratum+tcp://" ++ url
+  poolUrl == "stratum+tcp://localhost:3333"

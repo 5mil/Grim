@@ -1,0 +1,408 @@
+-- Grim.Shim.Hardware
+-- Physical hardware mining support: GawMiner Fury, Bitaxe, GPU miners
+--
+-- This module bridges real mining hardware into the same ShimQueues
+-- interface used by Grim.Shim.Stratum. The proof loop, reputation,
+-- audit, and stream layers see no difference between a software Stratum
+-- worker and a physical ASIC or GPU.
+--
+-- Supported hardware backends:
+--
+--   FuryUSB  — GawMiner Fury (Scrypt ASIC, USB/HID)
+--              Communicates via libusb HID. Receives work template from
+--              Grim's internal job queue, submits nonces via HID report.
+--              Rated ~1.3 MH/s Scrypt. Does NOT speak Stratum itself;
+--              Grim drives it directly.
+--
+--   BitaxeHTTP — Bitaxe (open-source ESP32-based SHA256d ASIC)
+--               Communicates via the Bitaxe HTTP JSON API on the local
+--               network (http://<ip>/api/system, /api/swarm, etc.).
+--               Bitaxe speaks its own REST API; Grim polls for shares
+--               and pushes work via HTTP POST.
+--               Rated ~400-1000+ GH/s SHA256d depending on model.
+--
+--   GPUMiner  — GPU workers via CGMiner / BFGMiner JSON-RPC API
+--               CGMiner/BFGMiner expose a JSON-RPC server on port 4028
+--               (default). Grim queries "summary", "pools", and pushes
+--               work via "addpool" / "removepool" commands.
+--               Supports AMD and NVIDIA GPUs via OpenCL/CUDA backends
+--               inside CGMiner/BFGMiner.
+--
+-- All three backends implement HardwareWorker ability and funnel results
+-- into ShimQueues via enqueueShare / enqueueBlock. runHardwareWorker
+-- is the top-level composition function called from Main.u.
+--
+-- The nonce search loop for each backend lives in the respective
+-- handler (handleFuryWorker, handleBitaxeWorker, handleGPUWorker).
+-- The pure PoW computation is in findNonce (WorkerNonce ability).
+
+use Grim.Types
+use Grim.Abilities
+use Grim.Shim.Stratum
+
+--------------------------------------------------------------------------------
+-- HARDWARE BACKEND TYPE
+-- Describes a physical mining device. Stored in GrimConfig.hardware.
+-- Main.u forks runHardwareWorker for each entry.
+--------------------------------------------------------------------------------
+
+type HardwareBackend
+  = FuryUSB {
+      devicePath : Text,      -- e.g. "/dev/hidraw0" or "usb:0483:5740"
+      coin       : Text,      -- must be Scrypt algorithm
+      workerId   : Text       -- e.g. "fury.0"
+    }
+  | BitaxeHTTP {
+      host       : Text,      -- e.g. "192.168.1.42" (no scheme, no port)
+      port       : Nat,       -- default 80
+      coin       : Text,      -- must be SHA256d algorithm
+      workerId   : Text       -- e.g. "bitaxe.living-room"
+    }
+  | GPUMiner {
+      host       : Text,      -- CGMiner/BFGMiner JSON-RPC host (usually 127.0.0.1)
+      rpcPort    : Nat,       -- default 4028
+      coin       : Text,
+      workerId   : Text,      -- e.g. "gpu.0"
+      gpuIndex   : Nat        -- GPU index for per-device stats
+    }
+
+hardwareCoin : HardwareBackend -> Text
+hardwareCoin hw = match hw with
+  FuryUSB r    -> r.coin
+  BitaxeHTTP r -> r.coin
+  GPUMiner r   -> r.coin
+
+hardwareWorkerId : HardwareBackend -> Text
+hardwareWorkerId hw = match hw with
+  FuryUSB r    -> r.workerId
+  BitaxeHTTP r -> r.workerId
+  GPUMiner r   -> r.workerId
+
+hardwareToText : HardwareBackend -> Text
+hardwareToText hw = match hw with
+  FuryUSB r    -> "fury:" ++ r.devicePath ++ ":" ++ r.coin
+  BitaxeHTTP r -> "bitaxe:" ++ r.host ++ ":" ++ Nat.toText r.port ++ ":" ++ r.coin
+  GPUMiner r   -> "gpu:" ++ r.host ++ ":" ++ Nat.toText r.rpcPort ++ ":" ++ r.coin
+
+--------------------------------------------------------------------------------
+-- HARDWARE WORKER ABILITY
+-- Typed effect surface for hardware I/O.
+-- Each backend has its own handler; the ability operations are shared.
+--
+-- Operations:
+--   getWork      : poll or receive a new work template for the device
+--   submitNonce  : push a found nonce back to the device controller
+--   getHashrate  : read current hashrate from the device (H/s as Nat)
+--   getTemperature : read device temperature in Celsius * 10 (e.g. 650 = 65.0°C)
+--   resetDevice  : soft-reset the device (recovers from error state)
+--------------------------------------------------------------------------------
+
+ability HardwareWorker where
+  getWork        : JobTemplate
+  submitNonce    : Text -> Text -> ()   -- jobId, nonce (hex)
+  getHashrate    : Nat
+  getTemperature : Nat
+  resetDevice    : ()
+
+--------------------------------------------------------------------------------
+-- WORKER NONCE ABILITY
+-- The PoW computation boundary. Given a job template and difficulty,
+-- produce a valid nonce. Separated as an ability so it can be:
+--   - implemented as a tight native loop (FFI) in production
+--   - mocked in tests (return a canned nonce instantly)
+--   - delegated to hardware (FuryUSB, Bitaxe, GPU) by their handlers
+--
+-- findNonce blocks until a valid nonce is found or the job is stale.
+-- Returns None if the job was superseded before a nonce was found
+-- (caller should discard and wait for next Notify).
+--------------------------------------------------------------------------------
+
+ability WorkerNonce where
+  findNonce : JobTemplate -> Nat -> Optional Text  -- job, difficulty -> nonce
+
+-- Software nonce handler: tight native loop via FFI
+-- In production this calls into a C/Rust nonce-finding routine
+handleWorkerNonceSoftware : forall r. '{WorkerNonce} r -> r
+handleWorkerNonceSoftware program =
+  handle !program with
+    WorkerNonce.findNonce job diff -> resume ->
+      nonce = nativeFindNonce job.coinbase1 job.ntime job.nbits diff
+      resume (Some nonce)
+    return r -> r
+
+-- Mock nonce handler: always succeeds immediately (for tests)
+handleWorkerNonceMock : forall r. '{WorkerNonce} r -> r
+handleWorkerNonceMock program =
+  handle !program with
+    WorkerNonce.findNonce _job _diff -> resume ->
+      resume (Some "deadbeef00000000")
+    return r -> r
+
+-- FFI stub: native nonce-finding loop
+nativeFindNonce : Text -> Text -> Text -> Nat -> Text
+
+--------------------------------------------------------------------------------
+-- FURY USB HANDLER
+-- GawMiner Fury: Scrypt ASIC, USB/HID interface.
+-- Protocol: HID reports carry work structs and nonce responses.
+-- Grim drives the device directly; the Fury does NOT speak Stratum.
+--
+-- Work flow:
+--   1. Grim fetches the latest JobTemplate from the internal job queue
+--      (populated by shimNodeMonitor or upstream pool notify)
+--   2. Grim serialises the work struct and writes it via hidWrite
+--   3. Fury responds with a nonce report via hidRead
+--   4. Grim validates and enqueues the share
+--
+-- The Fury operates at ~1.3 MH/s Scrypt.
+-- Multiple Fury devices can be run concurrently (one fiber per device).
+--------------------------------------------------------------------------------
+
+handleFuryWorker : forall r. Text -> '{HardwareWorker} r -> r
+handleFuryWorker devicePath program =
+  handle !program with
+    HardwareWorker.getWork         -> resume ->
+      job = furyPollJob devicePath
+      resume job
+    HardwareWorker.submitNonce jobId nonce -> resume ->
+      furySubmitNonce devicePath jobId nonce
+      resume ()
+    HardwareWorker.getHashrate     -> resume ->
+      hr = furyGetHashrate devicePath
+      resume hr
+    HardwareWorker.getTemperature  -> resume ->
+      temp = furyGetTemperature devicePath
+      resume temp
+    HardwareWorker.resetDevice     -> resume ->
+      furyReset devicePath
+      resume ()
+    return r -> r
+
+-- FFI stubs: libusb HID
+furyPollJob        : Text -> JobTemplate
+furySubmitNonce    : Text -> Text -> Text -> ()
+furyGetHashrate    : Text -> Nat
+furyGetTemperature : Text -> Nat
+furyReset          : Text -> ()
+
+--------------------------------------------------------------------------------
+-- BITAXE HTTP HANDLER
+-- Bitaxe: open-source ESP32 ASIC miner, SHA256d, HTTP JSON API.
+-- API endpoints:
+--   GET  http://<host>:<port>/api/system        → device info + hashrate
+--   POST http://<host>:<port>/api/system        → update settings
+--   GET  http://<host>:<port>/api/swarm/info    → swarm/pool status
+--   POST http://<host>:<port>/api/swarm         → push new work / pool config
+--
+-- Grim acts as the upstream pool for Bitaxe:
+--   - Pushes stratum-style work via /api/swarm
+--   - Polls /api/system for shares and hashrate
+--   - Bitaxe firmware handles nonce search internally (SHA256d ASIC)
+--
+-- The Bitaxe does its own PoW; findNonce is not called for this backend.
+-- Shares arrive as completed nonce reports in the /api/system response.
+--------------------------------------------------------------------------------
+
+handleBitaxeWorker : forall r. Text -> Nat -> '{HardwareWorker} r -> r
+handleBitaxeWorker host port program =
+  handle !program with
+    HardwareWorker.getWork         -> resume ->
+      -- Bitaxe pulls work from its configured pool; Grim polls for results
+      job = bitaxePollJob host port
+      resume job
+    HardwareWorker.submitNonce jobId nonce -> resume ->
+      -- Bitaxe self-submits; this is a no-op for the Grim side
+      -- (share is captured via /api/system polling, not pushed here)
+      resume ()
+    HardwareWorker.getHashrate     -> resume ->
+      hr = bitaxeGetHashrate host port
+      resume hr
+    HardwareWorker.getTemperature  -> resume ->
+      temp = bitaxeGetTemperature host port
+      resume temp
+    HardwareWorker.resetDevice     -> resume ->
+      bitaxeReset host port
+      resume ()
+    return r -> r
+
+-- FFI stubs: HTTP client calls to Bitaxe REST API
+bitaxePollJob        : Text -> Nat -> JobTemplate
+bitaxeGetHashrate    : Text -> Nat -> Nat
+bitaxeGetTemperature : Text -> Nat -> Nat
+bitaxeReset          : Text -> Nat -> ()
+
+--------------------------------------------------------------------------------
+-- GPU MINER HANDLER
+-- GPU workers via CGMiner / BFGMiner JSON-RPC API (port 4028 default).
+-- CGMiner/BFGMiner manage the actual GPU mining; Grim communicates with
+-- them as a controller, pushing pool config and reading share stats.
+--
+-- CGMiner JSON-RPC commands used:
+--   summary       → overall stats (hashrate, accepted/rejected shares)
+--   pools         → current pool list
+--   addpool       → add a pool URL (used to point GPU at Grim's stratum port)
+--   removepool    → remove a pool by ID
+--   gpucount      → number of GPUs
+--   gpu <n>       → per-GPU stats (hashrate, temp, fan)
+--   restart       → soft restart
+--
+-- In InternalPool mode: Grim adds itself as the pool via addpool
+--   pointing to localhost:stratumPort. CGMiner connects inbound
+--   to Grim's shimAcceptLoop as a normal miner.
+--
+-- In ExternalPool mode: Grim adds the upstream pool URL via addpool.
+--   Shares flow upstream; Grim monitors stats locally.
+--
+-- GPU hardware does its own PoW (CUDA/OpenCL); findNonce not called.
+--------------------------------------------------------------------------------
+
+handleGPUWorker : forall r. Text -> Nat -> Nat -> '{HardwareWorker} r -> r
+handleGPUWorker host rpcPort gpuIndex program =
+  handle !program with
+    HardwareWorker.getWork         -> resume ->
+      job = cgminerGetWork host rpcPort gpuIndex
+      resume job
+    HardwareWorker.submitNonce jobId nonce -> resume ->
+      -- GPU submits shares to its configured pool directly;
+      -- Grim captures them via summary/gpu polling
+      resume ()
+    HardwareWorker.getHashrate     -> resume ->
+      hr = cgminerGetHashrate host rpcPort gpuIndex
+      resume hr
+    HardwareWorker.getTemperature  -> resume ->
+      temp = cgminerGetTemperature host rpcPort gpuIndex
+      resume temp
+    HardwareWorker.resetDevice     -> resume ->
+      cgminerRestart host rpcPort
+      resume ()
+    return r -> r
+
+-- FFI stubs: CGMiner/BFGMiner JSON-RPC
+cgminerGetWork        : Text -> Nat -> Nat -> JobTemplate
+cgminerGetHashrate    : Text -> Nat -> Nat -> Nat
+cgminerGetTemperature : Text -> Nat -> Nat -> Nat
+cgminerRestart        : Text -> Nat -> ()
+-- Pool management
+cgminerAddPool        : Text -> Nat -> Text -> ()  -- host, rpcPort, stratumUrl
+cgminerRemovePool     : Text -> Nat -> Nat -> ()   -- host, rpcPort, poolId
+
+--------------------------------------------------------------------------------
+-- HARDWARE WORKER LOOP
+-- Common loop shared by all hardware backends.
+-- Calls getWork (hardware-specific), findNonce (WorkerNonce ability or
+-- delegated to hardware), then enqueues the resulting Share.
+--
+-- For Bitaxe and GPU miners the device handles nonce search internally;
+-- findNonce returns a canned result immediately (the device's share
+-- is captured via polling, not computed here).
+-- For FuryUSB, findNonce calls nativeFindNonce via WorkerNonce FFI.
+--------------------------------------------------------------------------------
+
+hardwareWorkerLoop : HardwareBackend -> '{HardwareWorker, WorkerNonce, ShimQueues, StratumSocket} ()
+hardwareWorkerLoop hw = do
+  job  = !getWork
+  diff = hardwareDefaultDiff hw
+  match !findNonce job diff with
+    None ->
+      -- Job went stale before nonce found; fetch next job
+      hardwareWorkerLoop hw
+    Some nonce ->
+      submitNonce job.jobId nonce
+      share =
+        { minerId    = hardwareWorkerId hw
+        , coin       = hardwareCoin hw
+        , difficulty = diff
+        , timestamp  = !now
+        }
+      enqueueShare share
+      hardwareWorkerLoop hw
+
+-- Default starting difficulty per backend type
+hardwareDefaultDiff : HardwareBackend -> Nat
+hardwareDefaultDiff hw = match hw with
+  FuryUSB _    -> 256      -- ~1.3 MH/s Scrypt; low diff to keep share rate up
+  BitaxeHTTP _ -> 65536    -- ~500 GH/s SHA256d; higher diff
+  GPUMiner _   -> 8192     -- variable; VarDiff takes over quickly
+
+--------------------------------------------------------------------------------
+-- RUN HARDWARE WORKER
+-- Top-level composition for a single hardware device.
+-- Called from Main.u via:  fork do runHardwareWorker hw
+--
+-- Stacks the correct HardwareWorker handler based on backend type,
+-- then stacks WorkerNonce (software fallback unless device self-solves),
+-- then delegates to hardwareWorkerLoop.
+--
+-- GPU and Bitaxe devices self-solve; the WorkerNonce mock handler is
+-- used because findNonce is never the critical path for those backends.
+--------------------------------------------------------------------------------
+
+runHardwareWorker : HardwareBackend -> '{ShimQueues, StratumSocket} ()
+runHardwareWorker hw =
+  match hw with
+    FuryUSB r ->
+      handleWorkerNonceSoftware
+        (handleFuryWorker r.devicePath
+          do hardwareWorkerLoop hw)
+    BitaxeHTTP r ->
+      handleWorkerNonceMock
+        (handleBitaxeWorker r.host r.port
+          do hardwareWorkerLoop hw)
+    GPUMiner r ->
+      -- For InternalPool coins, add Grim as the pool before starting the loop
+      cgminerAddPool r.host r.rpcPort ("stratum+tcp://localhost:" ++ Nat.toText r.rpcPort)
+      handleWorkerNonceMock
+        (handleGPUWorker r.host r.rpcPort r.gpuIndex
+          do hardwareWorkerLoop hw)
+
+--------------------------------------------------------------------------------
+-- HARDWARE MONITOR LOOP
+-- Polls hashrate and temperature for each device every 30 seconds.
+-- Emits stream events so the dashboard can display per-device stats.
+-- Runs concurrently with hardwareWorkerLoop (separate fork).
+--------------------------------------------------------------------------------
+
+hardwareMonitorLoop : HardwareBackend -> '{HardwareWorker, ShimQueues, StratumSocket, Stream} ()
+hardwareMonitorLoop hw = do
+  hr   = !getHashrate
+  temp = !getTemperature
+  -- Re-use broadcastShare event with workerId for now;
+  -- a dedicated HardwareStats stream event type is planned.
+  broadcastShare
+    { minerId    = hardwareWorkerId hw ++ ":hashrate=" ++ Nat.toText hr ++ ":temp=" ++ Nat.toText temp
+    , coin       = hardwareCoin hw
+    , difficulty = 0
+    , timestamp  = !now
+    }
+  platformSleepMs 30000
+  hardwareMonitorLoop hw
+
+--------------------------------------------------------------------------------
+-- TESTS
+--------------------------------------------------------------------------------
+
+testHardwareCoin : Bool
+testHardwareCoin =
+  fury    = FuryUSB    { devicePath = "/dev/hidraw0", coin = "VTC", workerId = "fury.0" }
+  bitaxe  = BitaxeHTTP { host = "192.168.1.42", port = 80, coin = "BTC", workerId = "bitaxe.0" }
+  gpu     = GPUMiner   { host = "127.0.0.1", rpcPort = 4028, coin = "DOGE", workerId = "gpu.0", gpuIndex = 0 }
+  hardwareCoin fury   == "VTC"  &&
+  hardwareCoin bitaxe == "BTC"  &&
+  hardwareCoin gpu    == "DOGE"
+
+testHardwareWorkerId : Bool
+testHardwareWorkerId =
+  fury = FuryUSB { devicePath = "/dev/hidraw0", coin = "VTC", workerId = "fury.0" }
+  hardwareWorkerId fury == "fury.0"
+
+testHardwareDefaultDiff : Bool
+testHardwareDefaultDiff =
+  fury   = FuryUSB    { devicePath = "/dev/hidraw0", coin = "VTC", workerId = "fury.0" }
+  bitaxe = BitaxeHTTP { host = "192.168.1.42", port = 80, coin = "BTC", workerId = "bitaxe.0" }
+  hardwareDefaultDiff fury   == 256   &&
+  hardwareDefaultDiff bitaxe == 65536
+
+testHardwareToText : Bool
+testHardwareToText =
+  fury = FuryUSB { devicePath = "/dev/hidraw0", coin = "VTC", workerId = "fury.0" }
+  Text.startsWith "fury:" (hardwareToText fury)

@@ -58,17 +58,15 @@ type Algorithm
 -- to an upstream Stratum URL and relaying work into the internal proof loop).
 --
 -- InternalPool  -- Grim runs its own Stratum TCP server on CoinDef.stratumPort.
---                  Miners connect inbound. This is the default self-hosted mode.
+--                  Miners and hardware workers connect inbound.
 --
--- ExternalPool url -- Grim connects outbound to `url` as a Stratum worker.
---                     url format: "stratum+tcp://host:port"
---                     Grim subscribes, receives jobs, submits shares, and feeds
---                     the same ShimQueues as the internal pool path.
---                     The proof loop, reputation, audit, and stream are identical
---                     regardless of which mode is active.
+-- ExternalPool url -- Grim connects outbound to url as a Stratum worker.
+--                     url format: "host:port" (no scheme prefix)
+--                     Hardware workers in this mode are pointed at the
+--                     upstream pool directly via cgminerAddPool.
 type PoolMode
   = InternalPool
-  | ExternalPool Text   -- Text = upstream Stratum URL
+  | ExternalPool Text
 
 poolModeToText : PoolMode -> Text
 poolModeToText mode = match mode with
@@ -90,7 +88,7 @@ type CoinDef = {
   stratumPort : Nat,    -- listening port for InternalPool; ignored for ExternalPool
   diff        : Nat,
   reward      : Nat,
-  poolMode    : PoolMode  -- NEW: routes shim to server or worker path
+  poolMode    : PoolMode
 }
 
 type Share = {
@@ -117,6 +115,14 @@ type MinerSession = {
   hashrate  : Nat,
   shares    : Nat
 }
+
+--------------------------------------------------------------------------------
+-- HARDWARE  (physical device config)
+-- Stored in GrimConfig.hardware. Main.u forks runHardwareWorker per entry.
+--------------------------------------------------------------------------------
+
+-- HardwareBackend is defined in Grim.Shim.Hardware.
+-- GrimConfig references it by type name.
 
 --------------------------------------------------------------------------------
 -- KNOWLEDGE  (dir core)
@@ -222,10 +228,13 @@ type AuditEntry = {
 
 type DeploymentProfile = LocalSelfHosted | LanciaCloud
 
+-- GrimConfig now carries hardware device list alongside coins.
+-- hardware entries are started independently of the coin shim loops.
 type GrimConfig = {
   profile        : DeploymentProfile,
   instanceId     : Text,
   governanceMode : GovernanceMode,
   defaultTier    : Tier,
-  coins          : [CoinDef]
+  coins          : [CoinDef],
+  hardware       : [HardwareBackend]   -- physical devices; empty list = software only
 }
