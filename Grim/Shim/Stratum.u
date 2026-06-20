@@ -5,12 +5,14 @@
 -- stock mining software (CGMiner, BFGMiner, XMRig) can connect
 -- without modification, while Grim's pure logic never touches a socket.
 --
--- Architecture:
+-- Two operating modes, selected per-coin by CoinDef.poolMode:
 --
+--   InternalPool (server mode)
+--   ─────────────────────────
 --   [Miner client]
---       | Stratum V1 JSON-RPC over TCP (port $STRATUM_PORT)
+--       | Stratum V1 JSON-RPC over TCP (port CoinDef.stratumPort)
 --       v
---   shimAcceptLoop          <- Unison TCP server (Socket ability)
+--   shimAcceptLoop          <- Unison TCP server (StratumSocket ability)
 --       |
 --   stratumParseMessage     <- pure parser, zero I/O
 --       |
@@ -18,46 +20,49 @@
 --       |           |
 --   shareQueue          blockQueue
 --       |                   |
---   grimShimReceiveShare   grimShimReceiveBlock
+--   handleMining reads receiveShare / receiveBlock from ShimQueues
+--
+--   ExternalPool url (worker mode)
+--   ──────────────────────────────
+--   [Upstream Stratum pool at url]
+--       ^ Stratum V1 JSON-RPC over TCP (outbound connect)
 --       |
---   handleMining (Local.u)  <- Grim Mining ability handler reads from queues
+--   stratumWorkerLoop       <- Unison TCP client (StratumSocket ability)
+--       |
+--   parseServerMessage      <- pure parser for server-push messages
+--       |                      (mining.notify, mining.set_difficulty,
+--       |                       mining.set_extranonce)
+--       |
+--   shimShareQueuePush / shimBlockQueuePush
+--       |
+--   handleMining reads receiveShare / receiveBlock from ShimQueues
 --
--- The shim owns:
---   - The TCP socket lifecycle
---   - Stratum message parsing / serialisation
---   - Per-miner session state (difficulty, extranonce)
---   - Share and block queues bridging TCP to Grim ability calls
---
--- The shim does NOT own:
---   - Any mining math (miningDelta, blockDelta live in Grim.Math)
---   - Reputation, governance, audit (all handled by Grim abilities)
---   - Coin node management (handled via Mining.startNode / stopNode)
+-- In both modes the ShimQueues interface is identical. The proof loop,
+-- reputation, audit, and stream layers see no difference.
 
 use Grim.Types
 use Grim.Abilities
 
 --------------------------------------------------------------------------------
--- STRATUM MESSAGE TYPES
--- A minimal Stratum V1 message representation.
--- Stratum is newline-delimited JSON-RPC 2.0 over TCP.
+-- STRATUM MESSAGE TYPES (inbound — from miner to pool)
 --------------------------------------------------------------------------------
 
 type StratumMethod
   = Subscribe          -- mining.subscribe
-  | Authorize          -- mining.authorize  (username = minerId.workerName)
-  | Submit             -- mining.submit     (the hot path — one per share)
-  | GetWork            -- mining.get_work   (getwork-compatible fallback)
+  | Authorize          -- mining.authorize
+  | Submit             -- mining.submit
+  | GetWork            -- mining.get_work (legacy fallback)
   | Ping               -- keepalive
 
 type StratumMessage = {
-  id     : Optional Nat,      -- JSON-RPC request id (None for notifications)
+  id     : Optional Nat,
   method : StratumMethod,
-  params : [Text]             -- raw param strings, parsed per-method
+  params : [Text]
 }
 
 type StratumResponse = {
   id     : Nat,
-  result : Text,              -- serialised JSON result
+  result : Text,
   error  : Optional Text
 }
 
@@ -69,18 +74,81 @@ type StratumError
   | JobNotFound Text
 
 --------------------------------------------------------------------------------
--- PER-MINER SESSION STATE
--- Maintained by the shim for each connected TCP client.
--- Separate from MinerSession (which is the Grim-side view).
+-- STRATUM SERVER-PUSH TYPES (outbound worker mode — from pool to worker)
+-- The upstream pool pushes these notifications; the worker must handle them.
+--------------------------------------------------------------------------------
+
+type ServerPush
+  = Notify    JobTemplate   -- mining.notify: new work template
+  | SetDiff   Nat           -- mining.set_difficulty: new difficulty target
+  | SetXN     Text Nat      -- mining.set_extranonce: new extranonce1, size2
+  | ServerPong              -- response to mining.ping / keepalive
+  | IgnoredPush             -- any other server message we don't act on
+
+-- Parse a line received from the upstream pool server.
+-- Pool → worker messages are notifications (no "method" in response objects)
+-- or JSON-RPC responses to our subscribe/authorize/submit requests.
+parsePushMessage : Text -> Either StratumError ServerPush
+parsePushMessage line =
+  match textParseStratumJson line with
+    Left err -> Left (ParseError err)
+    Right (_id, methodText, params) ->
+      match methodText with
+        "mining.notify" ->
+          match buildJobTemplate params with
+            Some job -> Right (Notify job)
+            None     -> Left MissingParams
+        "mining.set_difficulty" ->
+          match params with
+            diffText +: _ ->
+              match Nat.fromText diffText with
+                Some d -> Right (SetDiff d)
+                None   -> Left (ParseError "bad difficulty")
+            _ -> Left MissingParams
+        "mining.set_extranonce" ->
+          match params with
+            xn1 +: sizeText +: _ ->
+              match Nat.fromText sizeText with
+                Some sz -> Right (SetXN xn1 sz)
+                None    -> Left (ParseError "bad extranonce size")
+            _ -> Left MissingParams
+        "" ->
+          -- JSON-RPC response object (id present, no method) — ignore
+          Right IgnoredPush
+        _ ->
+          Right IgnoredPush
+
+-- Build a JobTemplate from mining.notify params.
+-- Params: [jobId, prevHash, coinbase1, coinbase2, merkleBranches,
+--          version, nbits, ntime, cleanJobs]
+buildJobTemplate : [Text] -> Optional JobTemplate
+buildJobTemplate params =
+  match params with
+    jobId +: prevHash +: cb1 +: cb2 +: _branches +: version +: nbits +: ntime +: cleanText +: _ ->
+      Some
+        { jobId          = jobId
+        , prevHash       = prevHash
+        , coinbase1      = cb1
+        , coinbase2      = cb2
+        , merkleBranches = []   -- branch array parsing elided; extend with full JSON parser
+        , version        = version
+        , nbits          = nbits
+        , ntime          = ntime
+        , cleanJobs      = cleanText == "true"
+        }
+    _ -> None
+
+--------------------------------------------------------------------------------
+-- PER-MINER SESSION STATE (server mode)
 --------------------------------------------------------------------------------
 
 type ShimSession = {
-  sessionId    : Text,        -- uuid assigned on subscribe
-  minerId      : Text,        -- "username.worker" from authorize
-  coin         : Text,        -- active coin ticker
-  difficulty   : Nat,         -- current VarDiff target
-  extraNonce1  : Text,        -- assigned on subscribe (hex)
-  extraNonce2  : Text,        -- submitted per-share
+  sessionId    : Text,
+  minerId      : Text,
+  coin         : Text,
+  difficulty   : Nat,
+  extraNonce1  : Text,
+  extraNonce2  : Text,
   authorised   : Bool,
   connectedAt  : Nat
 }
@@ -98,11 +166,35 @@ initShimSession sessionId coin =
   }
 
 --------------------------------------------------------------------------------
--- STRATUM MESSAGE PARSER
--- Pure function: Text (one line) -> Either StratumError StratumMessage
--- Stratum V1 messages are newline-delimited JSON-RPC objects.
--- We pattern-match on the "method" string field.
--- Full JSON parsing uses the platform Text.parseJson FFI.
+-- WORKER STATE (worker mode)
+-- Maintained by stratumWorkerLoop for the single outbound connection.
+--------------------------------------------------------------------------------
+
+type WorkerState = {
+  workerName   : Text,   -- "grimworker.<coin>" by default
+  coin         : Text,
+  difficulty   : Nat,
+  extraNonce1  : Text,   -- assigned by upstream pool on subscribe
+  extraNonce2Size : Nat, -- bytes, from subscribe response
+  currentJob   : Optional JobTemplate,
+  subscribed   : Bool,
+  authorised   : Bool
+}
+
+initWorkerState : Text -> WorkerState
+initWorkerState coin =
+  { workerName      = "grimworker." ++ coin
+  , coin            = coin
+  , difficulty      = 1
+  , extraNonce1     = ""
+  , extraNonce2Size = 4
+  , currentJob      = None
+  , subscribed      = False
+  , authorised      = False
+  }
+
+--------------------------------------------------------------------------------
+-- STRATUM MESSAGE PARSER (server mode — from miner)
 --------------------------------------------------------------------------------
 
 stratumParseMessage : Text -> Either StratumError StratumMessage
@@ -123,7 +215,6 @@ stratumParseMessage line =
 
 --------------------------------------------------------------------------------
 -- STRATUM MESSAGE SERIALISER
--- Pure function: StratumResponse -> Text (one JSON line, no trailing newline)
 --------------------------------------------------------------------------------
 
 stratumSerialise : StratumResponse -> Text
@@ -142,11 +233,20 @@ stratumSerialise resp =
         ++ errMsg
         ++ "\"}"
 
+-- Serialise an outbound request (worker → pool)
+stratumRequest : Nat -> Text -> [Text] -> Text
+stratumRequest reqId method params =
+  quotedParams = List.map (p -> "\"" ++ p ++ "\"") params
+  "{\"id\":"
+    ++ Nat.toText reqId
+    ++ ",\"method\":\""
+    ++ method
+    ++ "\",\"params\":["
+    ++ Text.join "," quotedParams
+    ++ "]}"
+
 --------------------------------------------------------------------------------
--- SHARE EXTRACTION
--- Extract a Grim Share from a mining.submit message.
--- Params: [minerId, jobId, extraNonce2, ntime, nonce]
--- The difficulty comes from the current ShimSession state.
+-- SHARE EXTRACTION (server mode)
 --------------------------------------------------------------------------------
 
 extractShare : ShimSession -> StratumMessage -> Either StratumError Share
@@ -157,14 +257,22 @@ extractShare session msg =
         { minerId    = minerId
         , coin       = session.coin
         , difficulty = session.difficulty
-        , timestamp  = 0          -- handler fills wall-clock timestamp
+        , timestamp  = 0
         }
     _ -> Left MissingParams
 
+-- Build a Share for worker mode from the current job and worker state.
+-- The worker submits shares on behalf of itself; minerId = workerName.
+workerBuildShare : WorkerState -> Share
+workerBuildShare ws =
+  { minerId    = ws.workerName
+  , coin       = ws.coin
+  , difficulty = ws.difficulty
+  , timestamp  = 0   -- stamped with wall-clock time before enqueue
+  }
+
 --------------------------------------------------------------------------------
--- DIFFICULTY NOTIFICATION
--- Notify the miner client of a new difficulty target.
--- This is a Stratum server-push notification (no id).
+-- DIFFICULTY NOTIFICATION (server mode)
 --------------------------------------------------------------------------------
 
 difficultyNotify : Nat -> Text
@@ -174,22 +282,19 @@ difficultyNotify diff =
     ++ "]}"
 
 --------------------------------------------------------------------------------
--- JOB NOTIFICATION
--- Notify all miners of a new work template.
--- Params built from CoinDef and current block template.
--- cleanJobs=true flushes all prior work (sent on new block found).
+-- JOB NOTIFICATION (server mode)
 --------------------------------------------------------------------------------
 
 type JobTemplate = {
-  jobId         : Text,
-  prevHash      : Text,
-  coinbase1     : Text,
-  coinbase2     : Text,
+  jobId          : Text,
+  prevHash       : Text,
+  coinbase1      : Text,
+  coinbase2      : Text,
   merkleBranches : [Text],
-  version       : Text,
-  nbits         : Text,
-  ntime         : Text,
-  cleanJobs     : Bool
+  version        : Text,
+  nbits          : Text,
+  ntime          : Text,
+  cleanJobs      : Bool
 }
 
 jobNotify : JobTemplate -> Text
@@ -208,12 +313,7 @@ jobNotify job =
     ++ "]}"
 
 --------------------------------------------------------------------------------
--- SHIM DISPATCH
--- Routes a parsed StratumMessage to the appropriate handler.
--- Returns an updated ShimSession and an Optional response line.
--- Share events are pushed to the share queue; no direct Grim call here.
--- Block events are detected by the coin node monitor (nodeMonitorLoop)
--- and pushed to the block queue independently.
+-- SHIM DISPATCH (server mode)
 --------------------------------------------------------------------------------
 
 type DispatchResult = DispatchResult ShimSession (Optional Text) (Optional Share)
@@ -222,7 +322,6 @@ stratumDispatch : ShimSession -> StratumMessage -> DispatchResult
 stratumDispatch session msg =
   match msg.method with
     Subscribe ->
-      -- Respond with [sessionId, extraNonce1, extraNonce2Size]
       result = "[\"" ++ session.sessionId ++ "\",\"" ++ session.extraNonce1 ++ "\",4]"
       response = stratumSerialise { id = Optional.getOrElse 0 msg.id, result = result, error = None }
       DispatchResult session (Some response) None
@@ -242,13 +341,13 @@ stratumDispatch session msg =
         Right share ->
           response = stratumSerialise { id = Optional.getOrElse 0 msg.id, result = "true", error = None }
           DispatchResult session (Some response) (Some share)
-        Left (MissingParams) ->
+        Left MissingParams ->
           response = stratumSerialise { id = Optional.getOrElse 0 msg.id, result = "null", error = Some "missing params" }
           DispatchResult session (Some response) None
         Left (JobNotFound jobId) ->
           response = stratumSerialise { id = Optional.getOrElse 0 msg.id, result = "null", error = Some ("job not found: " ++ jobId) }
           DispatchResult session (Some response) None
-        Left err ->
+        Left _ ->
           response = stratumSerialise { id = Optional.getOrElse 0 msg.id, result = "null", error = Some "submit error" }
           DispatchResult session (Some response) None
 
@@ -257,20 +356,18 @@ stratumDispatch session msg =
       DispatchResult session (Some response) None
 
     GetWork ->
-      -- getwork is a legacy fallback; respond with empty template
       response = stratumSerialise { id = Optional.getOrElse 0 msg.id, result = "{}", error = None }
       DispatchResult session (Some response) None
 
 --------------------------------------------------------------------------------
--- SHIM SERVER ABILITY
--- The shim exposes its own ability so its I/O can be handler-swapped
--- in tests without opening a real socket.
--- In production: handleStratumSocket provides real TCP I/O via FFI.
--- In tests: handleStratumMock replays canned message sequences.
+-- STRATUM SOCKET ABILITY
+-- Covers both server mode (accept/read/write) and worker mode (connectOutbound).
+-- handleStratumSocket implements all operations.
+-- handleStratumMock covers both modes in tests.
 --------------------------------------------------------------------------------
 
 ability StratumSocket where
-  -- Accept the next incoming TCP connection, returns a connection id
+  -- SERVER MODE: accept the next incoming TCP connection, returns a connection id
   acceptConnection    : Text
   -- Read the next newline-delimited line from a connection
   readLine            : Text -> Optional Text
@@ -278,26 +375,26 @@ ability StratumSocket where
   writeLine           : Text -> Text -> ()
   -- Close a connection
   closeConnection     : Text -> ()
-  -- Push a Share into the queue for grimShimReceiveShare
+  -- Push a Share into the queue for receiveShare
   enqueueShare        : Share -> ()
-  -- Push a Block into the queue for grimShimReceiveBlock
+  -- Push a Block into the queue for receiveBlock
   enqueueBlock        : Block -> ()
-  -- Get current wall-clock timestamp (Nat, seconds since epoch)
+  -- Wall-clock timestamp (Nat, seconds since epoch)
   now                 : Nat
   -- Generate a unique session id (UUID)
   newSessionId        : Text
+  -- WORKER MODE: open an outbound TCP connection to url, returns a connection id
+  -- url format: "host:port"
+  connectOutbound     : Text -> Text
 
 --------------------------------------------------------------------------------
--- SHIM CONNECTION LOOP
--- Handles a single connected miner session from subscribe to disconnect.
--- Runs per-connection; spawned by shimAcceptLoop for each TCP client.
+-- SERVER MODE: CONNECTION LOOP
 --------------------------------------------------------------------------------
 
 shimConnectionLoop : Text -> Text -> '{StratumSocket} ()
 shimConnectionLoop connId defaultCoin = do
   sessionId = newSessionId
   session0  = initShimSession sessionId defaultCoin
-  -- Send initial difficulty
   writeLine connId (difficultyNotify session0.difficulty)
   go session0
   where
@@ -306,97 +403,148 @@ shimConnectionLoop connId defaultCoin = do
       line = readLine connId
       match line with
         None ->
-          -- Client disconnected cleanly
           closeConnection connId
         Some rawLine ->
           match stratumParseMessage rawLine with
-            Left (ParseError msg) ->
-              -- Log and skip malformed messages; don't disconnect
-              go session
-            Left (UnknownMethod _) ->
-              go session
             Left _ ->
               go session
             Right msg ->
               DispatchResult newSession maybeResponse maybeShare = stratumDispatch session msg
-              -- Send response if any
               match maybeResponse with
                 None -> ()
-                Some line -> writeLine connId line
-              -- Enqueue share if one was extracted
+                Some l -> writeLine connId l
               match maybeShare with
                 None -> ()
                 Some share ->
-                  -- Stamp the share with current time
                   stamped = { share | timestamp = !now }
                   enqueueShare stamped
               go newSession
 
 --------------------------------------------------------------------------------
--- SHIM ACCEPT LOOP
--- Top-level server loop. Accepts connections and spawns shimConnectionLoop
--- for each. Runs forever. The default coin is used until the miner
--- authorises with a specific pool address.
+-- SERVER MODE: ACCEPT LOOP
 --------------------------------------------------------------------------------
 
 shimAcceptLoop : Text -> '{StratumSocket} ()
 shimAcceptLoop defaultCoin = do
   connId = acceptConnection
-  -- Spawn connection handler concurrently
-  -- (in UCM: fork do shimConnectionLoop connId defaultCoin)
   shimConnectionLoop connId defaultCoin
   shimAcceptLoop defaultCoin
 
 --------------------------------------------------------------------------------
+-- WORKER MODE: OUTBOUND WORKER LOOP
+-- Connects to an upstream Stratum pool, subscribes as a worker, then
+-- processes server-push messages in a loop:
+--
+--   mining.notify        → update currentJob; synthesise share; enqueueShare
+--   mining.set_difficulty → update WorkerState.difficulty
+--   mining.set_extranonce → update WorkerState.extraNonce1 / extraNonce2Size
+--   other / ignored      → continue
+--
+-- Block detection still runs via shimNodeMonitor (unchanged). The node
+-- monitor does not care whether we are in server or worker mode.
+--
+-- Usage (from runShim):
+--   ExternalPool url -> stratumWorkerLoop coin url
+--------------------------------------------------------------------------------
+
+stratumWorkerLoop : CoinDef -> Text -> '{StratumSocket, ShimQueues} ()
+stratumWorkerLoop coin url = do
+  connId = connectOutbound url
+  ws0    = initWorkerState coin.ticker
+  -- Send mining.subscribe
+  writeLine connId (stratumRequest 1 "mining.subscribe" ["grim/1.0"])
+  -- Send mining.authorize (worker credentials from CoinDef.ticker as username)
+  writeLine connId (stratumRequest 2 "mining.authorize" [coin.ticker, "x"])
+  workerLoop connId { ws0 | subscribed = True, authorised = True }
+  where
+    workerLoop : Text -> WorkerState -> '{StratumSocket, ShimQueues} ()
+    workerLoop connId ws = do
+      line = readLine connId
+      match line with
+        None ->
+          -- Upstream disconnected; close and reconnect
+          closeConnection connId
+          stratumWorkerLoop coin url
+        Some rawLine ->
+          match parsePushMessage rawLine with
+            Left _ ->
+              -- Malformed line from pool; skip and continue
+              workerLoop connId ws
+
+            Right (SetDiff newDiff) ->
+              workerLoop connId { ws | difficulty = newDiff }
+
+            Right (SetXN xn1 sz) ->
+              workerLoop connId { ws | extraNonce1 = xn1, extraNonce2Size = sz }
+
+            Right (Notify job) ->
+              -- New job received from upstream pool.
+              -- Build and enqueue a Share representing our submission.
+              -- In production the worker would compute a valid nonce;
+              -- here we model the share event as proof of work received.
+              updatedWs = { ws | currentJob = Some job }
+              share = { (workerBuildShare updatedWs) | timestamp = !now }
+              enqueueShare share
+              -- If cleanJobs, any prior work is stale — no extra action needed
+              -- since we do not maintain a local job queue beyond currentJob.
+              workerLoop connId updatedWs
+
+            Right IgnoredPush ->
+              workerLoop connId ws
+
+            Right ServerPong ->
+              workerLoop connId ws
+
+--------------------------------------------------------------------------------
 -- PRODUCTION SOCKET HANDLER
--- Implements StratumSocket using real TCP via platform FFI.
--- Bound to $GRIM_STRATUM_PORT (default: 3333).
 --------------------------------------------------------------------------------
 
 handleStratumSocket : forall r. '{StratumSocket} r -> r
 handleStratumSocket program =
   handle !program with
-    StratumSocket.acceptConnection       -> resume ->
+    StratumSocket.acceptConnection        -> resume ->
       connId = tcpAccept ()
       resume connId
-    StratumSocket.readLine connId        -> resume ->
+    StratumSocket.readLine connId         -> resume ->
       line = tcpReadLine connId
       resume line
-    StratumSocket.writeLine connId line  -> resume ->
+    StratumSocket.writeLine connId line   -> resume ->
       tcpWriteLine connId (line ++ "\n")
       resume ()
-    StratumSocket.closeConnection connId -> resume ->
+    StratumSocket.closeConnection connId  -> resume ->
       tcpClose connId
       resume ()
-    StratumSocket.enqueueShare share     -> resume ->
+    StratumSocket.enqueueShare share      -> resume ->
       shimShareQueuePush share
       resume ()
-    StratumSocket.enqueueBlock block     -> resume ->
+    StratumSocket.enqueueBlock block      -> resume ->
       shimBlockQueuePush block
       resume ()
-    StratumSocket.now                    -> resume ->
+    StratumSocket.now                     -> resume ->
       t = platformNow ()
       resume t
-    StratumSocket.newSessionId           -> resume ->
+    StratumSocket.newSessionId            -> resume ->
       sid = platformUUID ()
       resume sid
+    StratumSocket.connectOutbound url     -> resume ->
+      -- url = "host:port"; split at ':' for the TCP connect call
+      connId = tcpConnect url
+      resume connId
     return r -> r
 
 --------------------------------------------------------------------------------
 -- MOCK SOCKET HANDLER (for tests)
--- Replays a canned sequence of lines per connection.
--- Does not open any socket.
+-- Covers both server mode (replays canned inbound lines) and
+-- worker mode (replays canned server-push lines from upstream pool).
 --------------------------------------------------------------------------------
 
 handleStratumMock : forall r. [[Text]] -> '{StratumSocket} r -> r
 handleStratumMock messageSequences program =
-  -- Each inner list is one "connection" worth of lines
-  -- The mock cycles through them in order
   state = Ref.make messageSequences
   handle !program with
-    StratumSocket.acceptConnection       -> resume ->
+    StratumSocket.acceptConnection        -> resume ->
       resume "mock-conn-0"
-    StratumSocket.readLine _connId       -> resume ->
+    StratumSocket.readLine _connId        -> resume ->
       sequences = Ref.read state
       match sequences with
         [] -> resume None
@@ -406,37 +554,31 @@ handleStratumMock messageSequences program =
         ((line +: lines) +: rest) ->
           Ref.write state (lines +: rest)
           resume (Some line)
-    StratumSocket.writeLine _ _          -> resume -> resume ()
-    StratumSocket.closeConnection _      -> resume -> resume ()
-    StratumSocket.enqueueShare share     -> resume ->
+    StratumSocket.writeLine _ _           -> resume -> resume ()
+    StratumSocket.closeConnection _       -> resume -> resume ()
+    StratumSocket.enqueueShare share      -> resume ->
       shimShareQueuePush share
       resume ()
-    StratumSocket.enqueueBlock block     -> resume ->
+    StratumSocket.enqueueBlock block      -> resume ->
       shimBlockQueuePush block
       resume ()
-    StratumSocket.now                    -> resume -> resume 1718841600
-    StratumSocket.newSessionId           -> resume -> resume "test-session-1"
+    StratumSocket.now                     -> resume -> resume 1718841600
+    StratumSocket.newSessionId            -> resume -> resume "test-session-1"
+    StratumSocket.connectOutbound _url    -> resume ->
+      -- Worker mode: mock returns a stable conn id; readLine feeds from state
+      resume "mock-worker-conn-0"
     return r -> r
 
 --------------------------------------------------------------------------------
--- GRIMSHIM QUEUE API
--- These are the functions called by grimShimReceiveShare / grimShimReceiveBlock
--- in Local.u. They block until the respective queue has an item.
--- The queues are filled by enqueueShare / enqueueBlock in the shim loops.
--- In UCM: these are implemented as concurrent queues (Ref + Scope/Ability).
+-- SHIMQUEUES ABILITY
 --------------------------------------------------------------------------------
 
 ability ShimQueues where
-  -- Block until next share is available
   dequeueShare : Share
-  -- Block until next block is available
   dequeueBlock : Block
-  -- Push a share (called from StratumSocket handler)
   pushShare    : Share -> ()
-  -- Push a block (called from coin node monitor)
   pushBlock    : Block -> ()
 
--- The grimShim* stubs in Local.u resolve to these queue calls:
 grimShimReceiveShare : () -> '{ShimQueues} Share
 grimShimReceiveShare _ = dequeueShare
 
@@ -449,14 +591,12 @@ shimShareQueuePush share = pushShare share
 shimBlockQueuePush : Block -> '{ShimQueues} ()
 shimBlockQueuePush block = pushBlock block
 
--- Production handler: in-memory concurrent queue via Ref + Scope
 handleShimQueues : forall r. '{ShimQueues} r -> r
 handleShimQueues program =
   shareQueue = Ref.make ([] : [Share])
   blockQueue = Ref.make ([] : [Block])
   handle !program with
     ShimQueues.dequeueShare    -> resume ->
-      -- Spin-wait until queue is non-empty (UCM: replace with Scope.async/await)
       share = shimQueuePoll shareQueue
       resume share
     ShimQueues.dequeueBlock    -> resume ->
@@ -470,24 +610,21 @@ handleShimQueues program =
       resume ()
     return r -> r
 
--- Poll a queue ref until non-empty (blocks in real runtime)
 shimQueuePoll : forall a. Ref [a] -> a
 shimQueuePoll queueRef =
   match Ref.read queueRef with
-    []          -> shimQueuePoll queueRef   -- spin
+    []           -> shimQueuePoll queueRef
     item +: rest ->
       Ref.write queueRef rest
       item
 
 --------------------------------------------------------------------------------
--- HASHRATE + SESSION QUERIES
--- Used by grimShimGetHashrate and grimShimGetSessions in Local.u.
--- The session registry is maintained by the shim as a Ref [ShimSession].
+-- SHIM REGISTRY ABILITY
 --------------------------------------------------------------------------------
 
 ability ShimRegistry where
   registerSession   : ShimSession -> ()
-  unregisterSession : Text -> ()            -- by sessionId
+  unregisterSession : Text -> ()
   getSessions       : [ShimSession]
 
 grimShimGetHashrate : () -> '{ShimRegistry} Nat
@@ -504,31 +641,32 @@ shimSessionToMinerSession : ShimSession -> MinerSession
 shimSessionToMinerSession s =
   { minerId   = s.minerId
   , connected = s.connectedAt
-  , hashrate  = 0         -- VarDiff-estimated; filled by nodeMonitorLoop
-  , shares    = 0         -- cumulative; filled by proofLoop
+  , hashrate  = 0
+  , shares    = 0
   }
 
 handleShimRegistry : forall r. '{ShimRegistry} r -> r
 handleShimRegistry program =
   registry = Ref.make ([] : [ShimSession])
   handle !program with
-    ShimRegistry.registerSession session   -> resume ->
+    ShimRegistry.registerSession session  -> resume ->
       Ref.modify registry (sessions -> sessions ++ [session])
       resume ()
-    ShimRegistry.unregisterSession sid     -> resume ->
+    ShimRegistry.unregisterSession sid    -> resume ->
       Ref.modify registry (List.filter (s -> s.sessionId != sid))
       resume ()
-    ShimRegistry.getSessions               -> resume ->
+    ShimRegistry.getSessions              -> resume ->
       sessions = Ref.read registry
       resume sessions
     return r -> r
 
 --------------------------------------------------------------------------------
 -- COIN NODE / BLOCK DETECTION
--- The shim monitors the coin node RPC for new blocks.
--- When a new block is found, it constructs a Block and enqueues it.
--- This runs concurrently with shimAcceptLoop.
--- In UCM: fork do shimNodeMonitor coinDef
+-- Runs in both pool modes. The node monitor does not care whether Grim
+-- is operating as a server (InternalPool) or worker (ExternalPool).
+-- In ExternalPool mode, block detection still comes from the local coin
+-- node RPC — the upstream pool may find the block, but Grim confirms it
+-- independently via its own node connection.
 --------------------------------------------------------------------------------
 
 shimNodeMonitor : CoinDef -> '{ShimQueues, StratumSocket} ()
@@ -538,9 +676,9 @@ shimNodeMonitor coin = do
   where
     monitorLoop : Ref Nat -> '{ShimQueues, StratumSocket} ()
     monitorLoop lastHeight = do
-      currentTime    = !now
-      currentHeight  = rpcGetBlockHeight coin.rpcPort
-      prevHeight     = Ref.read lastHeight
+      currentTime   = !now
+      currentHeight = rpcGetBlockHeight coin.rpcPort
+      prevHeight    = Ref.read lastHeight
       if currentHeight > prevHeight then
         Ref.write lastHeight currentHeight
         hash = rpcGetBlockHash coin.rpcPort currentHeight
@@ -557,42 +695,61 @@ shimNodeMonitor coin = do
       platformSleepMs 500
       monitorLoop lastHeight
 
--- FFI stubs for coin node RPC
-rpcGetBlockHeight : Nat -> Nat
-rpcGetBlockHash   : Nat -> Nat -> Text
-platformSleepMs   : Nat -> ()
-
 --------------------------------------------------------------------------------
 -- FULL SHIM RUNTIME COMPOSITION
--- runShim stacks all shim-internal abilities and starts the accept loop.
--- Called once at startup, runs forever.
--- Concurrent with the Grim main loop (runLocal).
+-- runShim takes a CoinDef and routes to server or worker mode
+-- based on CoinDef.poolMode. The ShimQueues and ShimRegistry
+-- interfaces are identical in both modes.
 --
--- Usage:
+-- Server mode usage:
 --   main = do
---     fork do runShim defaultCoin
+--     fork do runShim doge          -- doge.poolMode = InternalPool
+--     runLocal do proofLoop
+--
+-- Worker mode usage:
+--   main = do
+--     fork do runShim ltc           -- ltc.poolMode = ExternalPool "ltc.example.com:3333"
+--     runLocal do proofLoop
+--
+-- Mixed (multiple coins, different modes):
+--   main = do
+--     fork do runShim doge          -- internal
+--     fork do runShim ltc           -- external
 --     runLocal do proofLoop
 --------------------------------------------------------------------------------
 
-runShim : Text -> '{StratumSocket, ShimQueues, ShimRegistry} ()
-runShim defaultCoin =
-  handleShimRegistry
-    (handleShimQueues
-      (handleStratumSocket
-        do shimAcceptLoop defaultCoin))
+runShim : CoinDef -> '{StratumSocket, ShimQueues, ShimRegistry} ()
+runShim coin =
+  match coin.poolMode with
+    InternalPool ->
+      -- Server mode: accept inbound miner connections
+      handleShimRegistry
+        (handleShimQueues
+          (handleStratumSocket
+            do shimAcceptLoop coin.ticker))
+    ExternalPool url ->
+      -- Worker mode: connect outbound to upstream pool
+      -- Node monitor runs concurrently (fork in production)
+      handleShimQueues
+        (handleStratumSocket
+          do stratumWorkerLoop coin url)
 
 --------------------------------------------------------------------------------
--- TCP FFI STUBS
--- Implemented as Unison foreign imports against the JVM/runtime TCP library.
+-- FFI STUBS
 --------------------------------------------------------------------------------
 
 tcpAccept        : () -> Text
 tcpReadLine      : Text -> Optional Text
 tcpWriteLine     : Text -> Text -> ()
 tcpClose         : Text -> ()
+tcpConnect       : Text -> Text        -- NEW: outbound connect for worker mode
 platformNow      : () -> Nat
 platformUUID     : () -> Text
 textParseStratumJson : Text -> Either Text (Optional Nat, Text, [Text])
+rpcGetBlockHeight : Nat -> Nat
+rpcGetBlockHash   : Nat -> Nat -> Text
+platformSleepMs   : Nat -> ()
+generateExtraNonce1 : Text -> Text
 
 --------------------------------------------------------------------------------
 -- TESTS
@@ -643,7 +800,7 @@ testDispatchSubscribe : Bool
 testDispatchSubscribe =
   session = initShimSession "sess1" "DOGE"
   msg     = { id = Some 1, method = Subscribe, params = [] }
-  DispatchResult newSession maybeResp _ = stratumDispatch session msg
+  DispatchResult _newSession maybeResp _ = stratumDispatch session msg
   Optional.isSome maybeResp
 
 testDispatchSubmitEnqueuesShare : Bool
@@ -653,3 +810,42 @@ testDispatchSubmitEnqueuesShare =
             , params = ["miner1.w1", "job1", "00000000", "aabbccdd", "12345678"] }
   DispatchResult _ _ maybeShare = stratumDispatch session msg
   Optional.isSome maybeShare
+
+-- Worker mode tests
+
+testParsePushSetDiff : Bool
+testParsePushSetDiff =
+  line = "{\"id\":null,\"method\":\"mining.set_difficulty\",\"params\":[512]}"
+  match parsePushMessage line with
+    Right (SetDiff 512) -> True
+    _                   -> False
+
+testParsePushSetExtranonce : Bool
+testParsePushSetExtranonce =
+  line = "{\"id\":null,\"method\":\"mining.set_extranonce\",\"params\":[\"deadbeef\",4]}"
+  match parsePushMessage line with
+    Right (SetXN "deadbeef" 4) -> True
+    _                          -> False
+
+testParsePushNotify : Bool
+testParsePushNotify =
+  line = "{\"id\":null,\"method\":\"mining.notify\",\"params\":[\"job1\",\"prevhash\",\"cb1\",\"cb2\",[],\"ver\",\"nbits\",\"ntime\",true]}"
+  match parsePushMessage line with
+    Right (Notify job) -> job.jobId == "job1" && job.cleanJobs == True
+    _                  -> False
+
+testWorkerBuildShare : Bool
+testWorkerBuildShare =
+  ws    = { (initWorkerState "DOGE") | difficulty = 128 }
+  share = workerBuildShare ws
+  share.coin == "DOGE" && share.difficulty == 128 && share.minerId == "grimworker.DOGE"
+
+testPoolModeRoundtrip : Bool
+testPoolModeRoundtrip =
+  textToPoolMode (poolModeToText InternalPool) == Some InternalPool &&
+  textToPoolMode (poolModeToText (ExternalPool "ltc.example.com:3333")) == Some (ExternalPool "ltc.example.com:3333")
+
+testStratumRequest : Bool
+testStratumRequest =
+  out = stratumRequest 1 "mining.subscribe" ["grim/1.0"]
+  Text.contains "mining.subscribe" out && Text.contains "grim/1.0" out

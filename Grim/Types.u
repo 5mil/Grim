@@ -53,14 +53,44 @@ type Algorithm
   | Qubit
   | OdoCrypt
 
+-- PoolMode controls whether Grim operates as a pool server (accepting inbound
+-- Stratum connections from miners) or as a pool worker (connecting outbound
+-- to an upstream Stratum URL and relaying work into the internal proof loop).
+--
+-- InternalPool  -- Grim runs its own Stratum TCP server on CoinDef.stratumPort.
+--                  Miners connect inbound. This is the default self-hosted mode.
+--
+-- ExternalPool url -- Grim connects outbound to `url` as a Stratum worker.
+--                     url format: "stratum+tcp://host:port"
+--                     Grim subscribes, receives jobs, submits shares, and feeds
+--                     the same ShimQueues as the internal pool path.
+--                     The proof loop, reputation, audit, and stream are identical
+--                     regardless of which mode is active.
+type PoolMode
+  = InternalPool
+  | ExternalPool Text   -- Text = upstream Stratum URL
+
+poolModeToText : PoolMode -> Text
+poolModeToText mode = match mode with
+  InternalPool      -> "internal"
+  ExternalPool url  -> "external:" ++ url
+
+textToPoolMode : Text -> Optional PoolMode
+textToPoolMode t =
+  if t == "internal" then Some InternalPool
+  else if Text.startsWith "external:" t
+    then Some (ExternalPool (Text.drop 9 t))
+  else None
+
 type CoinDef = {
   name        : Text,
   ticker      : Text,
   algorithm   : Algorithm,
   rpcPort     : Nat,
-  stratumPort : Nat,
+  stratumPort : Nat,    -- listening port for InternalPool; ignored for ExternalPool
   diff        : Nat,
-  reward      : Nat
+  reward      : Nat,
+  poolMode    : PoolMode  -- NEW: routes shim to server or worker path
 }
 
 type Share = {

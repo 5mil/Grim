@@ -7,16 +7,41 @@
 -- Only this file differs: every ability delegates to Unison Cloud
 -- primitives instead of local FFI / SQLite / file stubs.
 --
+-- MINING AND THE SHIM
+-- ───────────────────
+-- The Stratum shim (Grim.Shim.Stratum) is required in BOTH deployments.
+-- Stock miners speak Stratum V1 TCP regardless of whether Grim runs
+-- locally or in the cloud. What changes is where the shim runs and
+-- how it delivers events to handleMiningCloud:
+--
+--   Self-hosted (Local.u):
+--     Shim runs in the same process. grimShim* stubs read directly
+--     from ShimQueues (in-process). handleMining reads those queues.
+--
+--   Cloud (Cloud.u):
+--     Shim runs as a regional gateway node (separate process/container).
+--     The gateway speaks Stratum to miners, normalises events, and
+--     POSTs Share / Block JSON to the Grim Cloud HTTP endpoint.
+--     handleMiningCloud reads from the cloud-side inbound queue that
+--     the gateway POSTs into (cloudPool* stubs below).
+--
+-- In both cases CoinDef.poolMode is respected:
+--   InternalPool  — gateway runs shimAcceptLoop (accepts inbound miners)
+--   ExternalPool url — gateway runs stratumWorkerLoop (connects to upstream pool)
+--
+-- cloudPoolRegisterCoin persists the poolMode so the cloud gateway
+-- knows which loop to run for each coin.
+--
 -- Ability              Handler strategy
--- ──────────────────── ──────────────────────────────────────────────────────
--- Mining               Distributed pool HTTP gateway (cloud-routed shares)
+-- ──────────────────── ────────────────────────────────────────────────────────
+-- Mining               Cloud gateway (shim) → HTTP POST → cloudPool* queue
 -- Auth                 Unison Cloud KMS Ed25519 + JWKS endpoint (Lancia model)
 -- Knowledge            Unison Cloud entity store (content-addressed KV)
 -- Vault                Unison Cloud KMS — no local AES, no local key material
 -- Reputation           Cloud score store (HTTP API, consistent across nodes)
--- Governance           Cloud governance store (HTTP API, distributed consensus)
+-- Governance           Cloud governance store (HTTP API + event bus)
 -- Audit                Cloud append-only audit service (tamper-evident chain)
--- Stream               Cloud event bus (pub/sub — replaces local WebSocket)
+-- Stream               Cloud event bus (pub/sub)
 -- Crypto               Unison Cloud KMS — encrypt/decrypt/sign via cloud API
 
 use Grim.Types
@@ -24,28 +49,21 @@ use Grim.Abilities
 
 --------------------------------------------------------------------------------
 -- MINING HANDLER
--- The cloud mining handler routes pool events through the distributed
--- Unison Cloud HTTP gateway rather than a local Stratum TCP shim.
+-- Reads normalised Share / Block values from the cloud-side inbound queue.
+-- The queue is populated by the cloud gateway node running Grim.Shim.Stratum.
 --
--- Architecture:
---   [Miners] --Stratum--> [Regional gateway nodes]
---                                  |  HTTP POST
---                                  v
---                         [Unison Cloud HTTP endpoint]
---                                  |
---                         handleMiningCloud (this handler)
---                                  |
---                         proofLoop / blockLoop
+-- Per-coin routing (InternalPool vs ExternalPool) is handled by the gateway;
+-- handleMiningCloud sees only the resulting Share and Block values.
 --
--- The gateway layer is managed by the cloud deployment; Grim only
--- sees normalised Share / Block values delivered via the cloud HTTP
--- request context. No TCP logic lives here.
+-- cloudPoolRegisterCoin stores the CoinDef (including poolMode) to the cloud
+-- configuration store so the gateway process knows which shim loop to run.
 --------------------------------------------------------------------------------
 
 handleMiningCloud : forall r. '{Mining} r -> r
 handleMiningCloud program =
   handle !program with
     Mining.receiveShare       -> resume ->
+      -- Block until the cloud gateway delivers the next Share via HTTP
       share = cloudPoolReceiveShare ()
       resume share
     Mining.receiveBlock       -> resume ->
@@ -58,6 +76,8 @@ handleMiningCloud program =
       sessions = cloudPoolGetSessions ()
       resume sessions
     Mining.registerCoin coin  -> resume ->
+      -- Persist CoinDef including poolMode so the cloud gateway
+      -- runs the correct shim loop (InternalPool or ExternalPool url)
       cloudPoolRegisterCoin coin
       resume ()
     Mining.nodeStatus ticker  -> resume ->
@@ -71,12 +91,14 @@ handleMiningCloud program =
       resume ()
     return r -> r
 
--- Cloud HTTP stubs — delivered by the Unison Cloud pool gateway
+-- Cloud gateway stubs.
+-- These resolve to HTTP calls to the Unison Cloud pool gateway service.
+-- The gateway runs Grim.Shim.Stratum and POSTs normalised events here.
 cloudPoolReceiveShare  : () -> Share
 cloudPoolReceiveBlock  : () -> Block
 cloudPoolGetHashrate   : () -> Nat
 cloudPoolGetSessions   : () -> [MinerSession]
-cloudPoolRegisterCoin  : CoinDef -> ()
+cloudPoolRegisterCoin  : CoinDef -> ()   -- persists CoinDef.poolMode to gateway config
 cloudPoolNodeStatus    : Text -> NodeStatus
 cloudPoolStartNode     : Text -> ()
 cloudPoolStopNode      : Text -> ()
@@ -85,13 +107,12 @@ cloudPoolStopNode      : Text -> ()
 -- AUTH HANDLER
 -- Unison Cloud KMS for Ed25519 key operations (no local private key).
 -- JWKS endpoint served by this handler for downstream verifiers.
--- HS256 JWTs signed via KMS (key material never leaves the cloud HSM).
--- User store backed by the cloud entity store (same as Knowledge).
+-- JWT issuance calls cloudKmsSignJWT; key material never leaves the HSM.
+-- User store backed by the cloud entity store.
 --
 -- Differences from Local:
 --   - No scrypt / local password hash file; passwords hashed in KMS
 --   - No local Ed25519 key; sign/verify via cloudKmsSign / cloudKmsVerify
---   - JWT issuance calls cloudKmsSignJWT; local handler calls localAuthIssueToken
 --   - provisionCert delegates to cloudKmsProvisionCert (HSM-backed)
 --------------------------------------------------------------------------------
 
@@ -116,7 +137,6 @@ handleAuthCloud program =
       user = cloudAuthLoginCert nonce sig cert
       resume user
     Auth.issueToken user      -> resume ->
-      -- Key material never leaves the KMS; JWT is signed in the HSM
       token = cloudKmsSignJWT user
       resume token
     Auth.revokeToken jti      -> resume ->
@@ -139,30 +159,18 @@ handleAuthCloud program =
       resume ()
     return r -> r
 
--- Numeric rank for role comparison (mirrors Math.roleRank and Local.u)
 roleRank : Role -> Nat
 roleRank role = match role with
-  Banned   -> 0
-  Member   -> 1
-  Operator -> 2
-  Admin    -> 3
-  Owner    -> 4
+  Banned -> 0 | Member -> 1 | Operator -> 2 | Admin -> 3 | Owner -> 4
 
--- Numeric rank for tier comparison (mirrors Math.tierRank and Local.u)
 tierRank : Tier -> Nat
 tierRank tier = match tier with
-  Hearth  -> 0
-  Forge   -> 1
-  Foundry -> 2
-  Citadel -> 3
+  Hearth -> 0 | Forge -> 1 | Foundry -> 2 | Citadel -> 3
 
--- Cloud KMS stubs
 cloudKmsSignJWT       : User -> Text
 cloudKmsProvisionCert : Text -> Tier -> CertPayload
 cloudKmsSign          : Bytes -> Bytes
 cloudKmsVerify        : Text -> Text -> Text -> Bool
-
--- Cloud user store stubs
 cloudAuthGetCurrentUser : () -> User
 cloudAuthLogin          : Text -> Text -> User
 cloudAuthLoginCert      : Text -> Text -> CertPayload -> User
@@ -174,16 +182,8 @@ cloudAuthDeleteUser     : Text -> ()
 
 --------------------------------------------------------------------------------
 -- KNOWLEDGE HANDLER
--- Unison Cloud entity store: content-addressed key-value with
--- revision history baked in (same semantic contract as local SQLite).
--- The cloud store owns persistence and replication; Grim sees a
--- single logical namespace keyed by entity hash.
---
--- Differences from Local:
---   - No SQLite; cloud KV is the durable store
---   - cloudKvStore / cloudKvGet replace sqliteStoreEntity / sqliteGetEntity
---   - History traversal walks the cloud store's previous-hash chain
---   - listByType queries a cloud secondary index (maintained server-side)
+-- Unison Cloud entity store: content-addressed KV with revision history.
+-- Differences from Local: cloudKv* replaces sqlite*; cloud KV owns replication.
 --------------------------------------------------------------------------------
 
 handleKnowledgeCloud : forall r. '{Knowledge} r -> r
@@ -212,25 +212,18 @@ handleKnowledgeCloud program =
       resume ()
     return r -> r
 
--- Cloud KV stubs — Unison Cloud entity store
-cloudKvStore     : forall a. EntityType -> a -> Text -> Entity a
-cloudKvGet       : forall a. Hash -> Optional (Entity a)
-cloudKvHistory   : forall a. Hash -> [Entity a]
+cloudKvStore      : forall a. EntityType -> a -> Text -> Entity a
+cloudKvGet        : forall a. Hash -> Optional (Entity a)
+cloudKvHistory    : forall a. Hash -> [Entity a]
 cloudKvListByType : forall a. EntityType -> [Entity a]
-cloudKvUpdate    : forall a. Hash -> a -> Text -> Entity a
-cloudKvGetFacts  : Hash -> [Fact]
-cloudKvAddFact   : Hash -> Fact -> ()
+cloudKvUpdate     : forall a. Hash -> a -> Text -> Entity a
+cloudKvGetFacts   : Hash -> [Fact]
+cloudKvAddFact    : Hash -> Fact -> ()
 
 --------------------------------------------------------------------------------
 -- VAULT HANDLER
--- Unison Cloud KMS vault: all secrets stored as KMS-encrypted objects.
--- No local AES key. No local encrypted file.
--- The cloud HSM is the trust boundary for key material.
---
--- Differences from Local:
---   - cloudKmsVaultStore / cloudKmsVaultGet replace localVaultStore / localVaultGet
---   - Mining creds are stored as KMS secrets keyed by ticker symbol
---   - Rotation is an atomic KMS re-encrypt operation
+-- Unison Cloud KMS vault. No local AES key. No local encrypted file.
+-- Differences from Local: cloudKmsVault* replaces localVault*.
 --------------------------------------------------------------------------------
 
 handleVaultCloud : forall r. '{Vault} r -> r
@@ -259,7 +252,6 @@ handleVaultCloud program =
       resume result
     return r -> r
 
--- Cloud KMS vault stubs
 cloudKmsVaultStore      : Text -> Bytes -> ()
 cloudKmsVaultGet        : Text -> Optional Bytes
 cloudKmsVaultList       : () -> [Text]
@@ -270,14 +262,8 @@ cloudKmsVaultGetCreds   : Text -> Optional SecureData
 
 --------------------------------------------------------------------------------
 -- REPUTATION HANDLER
--- Cloud score store: reputation scores are held in a consistent
--- cloud KV namespace. Deltas are posted as atomic increments.
--- syncRole / syncTier read the cloud score then call the cloud
--- Auth handler to update role/tier — same pure Math functions as Local.
---
--- Differences from Local:
---   - cloudRepGetScore / cloudRepApplyDelta replace localRepGetScore etc.
---   - cloudAuthSetRole replaces localAuthSetRole (cross-handler call via cloud)
+-- Cloud score store. syncRole / syncTier use the same pure Math functions.
+-- Differences from Local: cloudRep* replaces localRep*.
 --------------------------------------------------------------------------------
 
 handleReputationCloud : forall r. '{Reputation} r -> r
@@ -305,7 +291,6 @@ handleReputationCloud program =
       resume tier
     return r -> r
 
--- Cloud reputation store stubs
 cloudRepGetScore   : Text -> Nat
 cloudRepApplyDelta : Text -> Int -> ()
 cloudRepGetHistory : Text -> [Nat]
@@ -313,14 +298,8 @@ cloudRepSetTier    : Text -> Tier -> ()
 
 --------------------------------------------------------------------------------
 -- GOVERNANCE HANDLER
--- Cloud governance store: mode and transition history are stored in
--- a consistent cloud KV namespace. Mode changes are broadcast to
--- all nodes via the event bus immediately after persisting.
---
--- Differences from Local:
---   - cloudGovGetMode / cloudGovSetMode replace local config-file ops
---   - setMode posts a broadcastModeChange event to the cloud event bus
---     as a side effect, keeping all nodes consistent without polling
+-- Cloud governance store. setMode broadcasts immediately to all nodes.
+-- Differences from Local: cloudGov* replaces localGov*; setMode emits event.
 --------------------------------------------------------------------------------
 
 handleGovernanceCloud : forall r. '{Governance} r -> r
@@ -331,7 +310,6 @@ handleGovernanceCloud program =
       resume mode
     Governance.setMode newMode  -> resume ->
       cloudGovSetMode newMode
-      -- propagate immediately to all cloud nodes via event bus
       cloudEventEmit "governance" (modeToText newMode)
       resume ()
     Governance.checkAccess userId action -> resume ->
@@ -342,7 +320,6 @@ handleGovernanceCloud program =
       resume history
     return r -> r
 
--- Cloud governance stubs
 cloudGovGetMode     : () -> GovernanceMode
 cloudGovSetMode     : GovernanceMode -> ()
 cloudGovCheckAccess : Text -> Action -> Bool
@@ -351,14 +328,8 @@ modeToText          : GovernanceMode -> Text
 
 --------------------------------------------------------------------------------
 -- AUDIT HANDLER
--- Cloud append-only audit service. The chain integrity guarantee
--- (each entry hashes its predecessor) is maintained server-side.
--- verifyChain delegates to the cloud audit service's own verification
--- endpoint rather than walking the file locally.
---
--- Differences from Local:
---   - cloudAuditAppend / cloudAuditRecent replace local JSONL appends
---   - verifyChain calls cloudAuditVerify (server-side chain walk)
+-- Cloud append-only audit service. verifyChain delegates server-side.
+-- Differences from Local: cloudAudit* replaces localAudit*.
 --------------------------------------------------------------------------------
 
 handleAuditCloud : forall r. '{Audit} r -> r
@@ -378,21 +349,15 @@ handleAuditCloud program =
       resume result
     return r -> r
 
--- Cloud audit service stubs
-cloudAuditAppend    : Text -> Text -> [(Text, Text)] -> ()
-cloudAuditRecent    : Nat -> [AuditEntry]
-cloudAuditForActor  : Text -> [AuditEntry]
-cloudAuditVerify    : () -> Bool
+cloudAuditAppend   : Text -> Text -> [(Text, Text)] -> ()
+cloudAuditRecent   : Nat -> [AuditEntry]
+cloudAuditForActor : Text -> [AuditEntry]
+cloudAuditVerify   : () -> Bool
 
 --------------------------------------------------------------------------------
 -- STREAM HANDLER
--- Cloud event bus (pub/sub) replaces the local WebSocket broadcast server.
--- The cloud event bus fans out to all subscribers across nodes;
--- the local handler only reaches clients of a single process.
---
--- Differences from Local:
---   - cloudEventEmit replaces wsEmit (same signature, cloud-routed)
---   - No persistent WS server process required; cloud bus owns fanout
+-- Cloud event bus replaces local WebSocket. cloudEventEmit fans out across
+-- all nodes. Differences from Local: cloudEventEmit replaces wsEmit.
 --------------------------------------------------------------------------------
 
 handleStreamCloud : forall r. '{Stream} r -> r
@@ -415,10 +380,7 @@ handleStreamCloud program =
       resume ()
     return r -> r
 
--- Cloud event bus stub
-cloudEventEmit : Text -> Text -> ()
-
--- JSON serialisation helpers (identical to Local.u — shared pure logic)
+cloudEventEmit   : Text -> Text -> ()
 shareToJson      : Share -> Text
 blockToJson      : Block -> Text
 repChangeToJson  : Text -> Nat -> Text
@@ -429,13 +391,7 @@ nodeStatusToJson : Text -> NodeStatus -> Text
 -- CRYPTO HANDLER
 -- Unison Cloud KMS for all cryptographic operations.
 -- Key material never materialises in the Grim process.
--- aesGcmEncrypt / aesGcmDecrypt route through the KMS HTTP API;
--- the KMS returns ciphertext or plaintext, never the raw key.
---
--- Differences from Local:
---   - cloudKmsEncrypt / cloudKmsDecrypt replace local aesGcmEncrypt / aesGcmDecrypt
---   - cloudKmsDeriveKey replaces local scryptDeriveKey
---   - cloudKmsRandomBytes replaces platformRandomBytes
+-- Differences from Local: cloudKms* replaces aesGcmEncrypt* / scrypt* / platformRandomBytes.
 --------------------------------------------------------------------------------
 
 handleCryptoCloud : forall r. '{Crypto} r -> r
@@ -455,24 +411,24 @@ handleCryptoCloud program =
       resume bytes
     return r -> r
 
--- Cloud KMS crypto stubs
-cloudKmsEncrypt    : Bytes -> Bytes -> EncryptedBytes
-cloudKmsDecrypt    : Bytes -> EncryptedBytes -> Bytes
-cloudKmsDeriveKey  : Text -> Bytes
+cloudKmsEncrypt     : Bytes -> Bytes -> EncryptedBytes
+cloudKmsDecrypt     : Bytes -> EncryptedBytes -> Bytes
+cloudKmsDeriveKey   : Text -> Bytes
 cloudKmsRandomBytes : Nat -> Bytes
 
 --------------------------------------------------------------------------------
 -- CLOUD RUNTIME COMPOSITION
--- Stacks all cloud handlers to produce a fully-handled program.
--- Call this from the Unison Cloud entry point to run the cloud Grim.
+-- Identical handler stack depth to runLocal (9 abilities, same order).
+-- The shim still runs — as a cloud gateway node — before this stack.
 --
--- Usage:
---   main = runCloud do
---            proofLoop
+-- Usage (cloud entry point):
+--   main = do
+--     -- Gateway is a separate cloud process running Grim.Shim.Stratum.
+--     -- It speaks Stratum to miners and POSTs events to this deployment.
+--     -- Coin pool modes are set in GrimConfig.coins[].poolMode.
+--     runCloud do proofLoop
 --
--- All abilities are satisfied by cloud handlers.
--- The deployment profile is CloudLancia.
--- The pure logic — proofLoop, canPerformAction, wikiTrust — is
+-- The pure logic (proofLoop, canPerformAction, wikiTrust) is
 -- content-addressed and identical to runLocal; only the handlers differ.
 --------------------------------------------------------------------------------
 
@@ -493,25 +449,28 @@ runCloud program =
 
 --------------------------------------------------------------------------------
 -- HANDLER COMPARISON TABLE
--- Documents the one-to-one correspondence between Local and Cloud handlers.
--- The ability surface (Grim.Abilities) is identical in both deployments.
 --
 -- Ability        Local handler          Cloud handler
--- ─────────────  ─────────────────────  ──────────────────────────
--- Mining         grimShim* FFI stubs    cloudPool* HTTP gateway
+-- ─────────────  ─────────────────────  ──────────────────────────────────────
+-- Mining         grimShim* FFI stubs    cloudPool* HTTP (from cloud gateway)
 -- Auth           localAuth* + SQLite    cloudAuth* + KMS JWT
 -- Knowledge      sqlite* FFI stubs      cloudKv* entity store
 -- Vault          localVault* AES-GCM    cloudKmsVault* KMS
 -- Reputation     localRep* flat-file    cloudRep* cloud KV
--- Governance     localGov* config-file  cloudGov* cloud KV
+-- Governance     localGov* config-file  cloudGov* cloud KV + event bus
 -- Audit          localAudit* JSONL      cloudAudit* cloud service
 -- Stream         wsEmit WebSocket       cloudEventEmit event bus
 -- Crypto         aesGcmEncrypt* FFI     cloudKms* KMS API
+--
+-- Shim presence:
+--   Both deployments require Grim.Shim.Stratum.
+--   Local: shim runs in-process, feeds ShimQueues directly.
+--   Cloud: shim runs as gateway node, feeds cloudPool* HTTP queue.
+--   CoinDef.poolMode (InternalPool | ExternalPool url) is respected in both.
 --------------------------------------------------------------------------------
 
 --------------------------------------------------------------------------------
 -- TESTS
--- All tests use pure (mock) data; no cloud calls.
 --------------------------------------------------------------------------------
 
 testCloudRoleRank : Bool
@@ -528,12 +487,3 @@ testCloudTierRank =
   tierRank Forge   == 1 &&
   tierRank Foundry == 2 &&
   tierRank Citadel == 3
-
--- Verify runCloud and runLocal have identical handler stack depth
--- (both wrap 9 abilities in the same order).
--- This is a structural assertion: if new abilities are added to
--- Grim.Abilities, both runLocal and runCloud must be updated together.
-testHandlerStackDepth : Bool
-testHandlerStackDepth =
-  -- 9 handlers: Crypto Stream Audit Governance Reputation Vault Knowledge Auth Mining
-  True -- structural: enforced by type-checking both runLocal and runCloud
