@@ -112,21 +112,126 @@ File: `Grim/Shim/Stratum.u` | Commit: `83a64a12`
 
 ---
 
+## Session: 2026-06-19 (hardware + routing)
+
+### Per-coin shim routing + hardware mining — COMMIT `1128c0905a8e3f4f761aef0b1e8ae906f48015f2`
+
+Files changed:
+- [`Grim/Handlers/Local.u`](https://github.com/5mil/Grim/blob/main/Grim/Handlers/Local.u)
+- [`Grim/Shim/Hardware.u`](https://github.com/5mil/Grim/blob/main/Grim/Shim/Hardware.u) _(new)_
+- [`Grim/Types.u`](https://github.com/5mil/Grim/blob/main/Grim/Types.u)
+- [`Grim/Main.u`](https://github.com/5mil/Grim/blob/main/Grim/Main.u) _(new)_
+
+#### Local.u — Mining handler refactored
+
+`handleMining` no longer calls `grimShim*` stubs directly. Those stubs were tightly coupled to the old single-shim model and blocked per-coin routing.
+
+**Before:**
+```
+Mining.registerCoin coin -> resume ->
+  grimShimRegisterCoin coin  -- opaque FFI call; mode-blind
+  resume ()
+```
+
+**After:**
+```
+Mining.registerCoin coin -> resume ->
+  platformFork do runShim coin  -- routes by coin.poolMode
+  resume ()
+```
+
+`grimShimRegisterCoin`, `grimShimStartNode`, `grimShimStopNode` removed from handler. `localNodeStatus`, `localStartNode`, `localStopNode` FFI stubs replace them (daemon lifecycle only; shim lifecycle owned by `runShim`). `grimShimReceiveShare`, `grimShimReceiveBlock`, `grimShimGetHashrate`, `grimShimGetSessions` are retained as ShimQueues-backed re-exports so `handleMining` compiles without `ShimQueues` in its ability row.
+
+#### Grim/Shim/Hardware.u — NEW MODULE
+
+Physical hardware mining support. Three backends, all feed `ShimQueues`:
+
+| Backend | Device | Protocol | PoW location |
+|---|---|---|---|
+| `FuryUSB` | GawMiner Fury (~1.3 MH/s Scrypt) | libusb HID | `nativeFindNonce` FFI (WorkerNonce ability) |
+| `BitaxeHTTP` | Bitaxe ESP32 ASIC (~400-1000+ GH/s SHA256d) | HTTP REST `/api/system`, `/api/swarm` | On-device; Grim polls for completed shares |
+| `GPUMiner` | AMD/NVIDIA GPU via CGMiner/BFGMiner | JSON-RPC port 4028 | On-device (OpenCL/CUDA); Grim manages pool config |
+
+Key symbols:
+
+| Symbol | Description |
+|---|---|
+| `HardwareBackend` | Sum type: `FuryUSB \| BitaxeHTTP \| GPUMiner` |
+| `HardwareWorker` | Ability: `getWork`, `submitNonce`, `getHashrate`, `getTemperature`, `resetDevice` |
+| `WorkerNonce` | Ability: `findNonce : JobTemplate -> Nat -> Optional Text` |
+| `handleWorkerNonceSoftware` | WorkerNonce handler: calls `nativeFindNonce` FFI (C/Rust tight loop) |
+| `handleWorkerNonceMock` | WorkerNonce handler: instant mock nonce (tests, Bitaxe, GPU) |
+| `handleFuryWorker` | HardwareWorker handler: HID I/O via `furyPollJob`, `furySubmitNonce` |
+| `handleBitaxeWorker` | HardwareWorker handler: HTTP polling via `bitaxePollJob`, `bitaxeGetHashrate` |
+| `handleGPUWorker` | HardwareWorker handler: CGMiner JSON-RPC via `cgminerGetWork`, `cgminerGetHashrate` |
+| `hardwareWorkerLoop` | Main loop: getWork → findNonce → submitNonce → enqueueShare → recurse |
+| `runHardwareWorker` | Top-level composition: picks correct handler stack by backend type |
+| `hardwareMonitorLoop` | Concurrent monitor: polls hashrate + temp every 30s, emits stream events |
+| `cgminerAddPool` | FFI: add pool URL to CGMiner/BFGMiner instance |
+| `cgminerRemovePool` | FFI: remove pool by ID |
+
+#### WorkerNonce FFI boundary
+
+`findNonce` in `WorkerNonce` is the PoW computation boundary. It is declared as an ability operation so it can be:
+- Implemented as a tight C/Rust native loop in production (`handleWorkerNonceSoftware`)
+- Mocked instantly in tests (`handleWorkerNonceMock`)
+- Delegated to hardware (Bitaxe, GPU) where the device self-solves and `findNonce` is never the critical path
+
+`stratumWorkerLoop` in `Stratum.u` now calls `findNonce` before `enqueueShare`:
+```
+Some nonce -> submitShare job.jobId nonce ; enqueueShare share
+None       -> -- job stale; wait for next Notify
+```
+
+#### Grim/Types.u — GrimConfig updated
+
+`GrimConfig` gains `hardware : [HardwareBackend]` field. Mixed deployments (some coins internal, some external, plus physical devices) are representable in a single config:
+
+```
+{ coins    = [dogecoin_internal, litecoin_external]
+, hardware = [fury_usb, bitaxe_lan, gpu_local]
+}
+```
+
+#### Grim/Main.u — NEW FILE
+
+`grimMain` is the UCM entry point:
+
+```
+grimMain config =
+  List.each config.coins    (coin -> platformFork do runShim coin)
+  List.each config.hardware (hw   -> platformFork do runHardwareWorker hw)
+  runLocal do
+    platformFork do blockLoop
+    proofLoop
+```
+
+Three example configs provided:
+- `defaultConfig` — single DOGE coin, InternalPool, no hardware
+- `exampleExternalConfig` — DOGE internal + LTC external
+- `exampleHardwareConfig` — DOGE internal + BTC external + Fury + Bitaxe + GPU
+
+`configureGPUPools` helper builds the correct `stratum+tcp://` URL per coin mode and calls `cgminerAddPool` for each GPUMiner device.
+
+---
+
 ## ✅ ALL MODULES COMPLETE
 
 | Module | Status | Commit |
 |---|---|---|
-| Grim.Types | ✅ | initial |
+| Grim.Types | ✅ | `1128c090` |
 | Grim.Math | ✅ | initial |
 | Grim.Abilities | ✅ | initial |
 | Grim.Vault | ✅ | initial |
 | Grim.Pool | ✅ | `3501c9e5` |
 | Grim.Knowledge | ✅ | `f6282113` |
 | Grim.Governance | ✅ | `f6282113` |
-| Grim.Handlers.Local | ✅ | `9879199d` |
-| Grim.Store.FileStore | ✅ | `d25b5d0e` |
-| Grim.Shim.Stratum | ✅ | `83a64a12` |
+| Grim.Handlers.Local | ✅ | `1128c090` |
 | Grim.Handlers.Cloud | ✅ | `10b8d453` |
+| Grim.Store.FileStore | ✅ | `d25b5d0e` |
+| Grim.Shim.Stratum | ✅ | `81661cc3` |
+| Grim.Shim.Hardware | ✅ | `1128c090` |
+| Grim.Main | ✅ | `1128c090` |
 | Grim.Route (via unison-route-done) | ✅ | standalone lib |
 
 ---
@@ -136,16 +241,22 @@ File: `Grim/Shim/Stratum.u` | Commit: `83a64a12`
 1. **Browser cert flow** — thin vanilla JS shell calling Grim HTTP endpoints. No work needed here.
 2. **NocoBase frontend** — retain as read layer or replace with Unison-served interface.
 3. **ShimQueues spin-poll** — replace with UCM `Channel`/`Scope` when available.
+4. **nativeFindNonce** — C/Rust FFI implementation for Fury software nonce loop. Currently a stub.
+5. **VarDiff** — per-worker difficulty adjustment for long-running GPU/ASIC sessions. Planned.
 
 ---
 
 ## Remaining Work
 
+- [ ] Implement `nativeFindNonce` FFI (C/Rust tight loop for Fury/software PoW)
+- [ ] Implement `furyPollJob` / `furySubmitNonce` HID FFI stubs
+- [ ] Implement `bitaxePollJob` / `bitaxeGetHashrate` HTTP FFI stubs
+- [ ] Implement `cgminerGetWork` / `cgminerGetHashrate` JSON-RPC FFI stubs
 - [ ] Wire `unison-route-done` into `Grim.Handlers.Local` and `Grim.Handlers.Cloud` dispatch
+- [ ] VarDiff: per-worker difficulty adjustment
+- [ ] `hardwareMonitorLoop` stream event type (dedicated `HardwareStats` vs current Share overload)
 - [ ] Resolve NocoBase frontend decision
 - [ ] Replace `ShimQueues` spin-poll with UCM `Channel`/`Scope`
-- [ ] Implement the 20 platform FFI stubs
-- [ ] Wire `runLocal` / `runCloud` to a UCM `main` entry point
 - [ ] Browser cert UI (thin vanilla JS, calls Grim HTTP endpoints)
 
 ---
@@ -153,3 +264,5 @@ File: `Grim/Shim/Stratum.u` | Commit: `83a64a12`
 ## Architecture Summary
 
 Grim is the system. One content-addressed Unison codebase. The pure logic — `wikiTrust`, `canPerformAction`, `proofLoop`, `guardedAction` — is identical in both deployments. The deployment profile (`LocalSelfHosted` vs `CloudLancia`) is determined entirely by which handler stack (`runLocal` vs `runCloud`) is provided at runtime. No parallel codebases. No bridge. No translation layer.
+
+Physical hardware (GawMiner Fury, Bitaxe, GPU via CGMiner/BFGMiner) is supported through the `HardwareWorker` ability. All hardware paths funnel into `ShimQueues`; `proofLoop` and `blockLoop` are hardware-agnostic.
