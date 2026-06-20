@@ -2,6 +2,61 @@
 
 ---
 
+## Session: 2026-06-19 (sidequest)
+
+### unison-route-done — EXTRACTED AS STANDALONE LIBRARY
+
+Repo: [github.com/5mil/unison-route-done](https://github.com/5mil/unison-route-done)  
+License: MIT
+
+A focused Unison library solving the "handler keeps executing past a respond" problem. Provides a `Route.Done` algebraic ability and a small set of response helpers and guard combinators. Zero dependency on Grim — designed to be usable in any Unison HTTP service.
+
+#### Core API
+
+| Symbol | Type | Description |
+|---|---|---|
+| `Route.Done` | `ability` | The short-circuit ability. `structural` keyword avoids hash-mismatch on upgrade. |
+| `Route.handle` | `'{Route.Done, e} r ->{e} r` | Runner. Catches early exit, returns committed response. Only place `Route.Done` is consumed. |
+| `Route.ok` | `Text ->{Route.Done} r` | 200 response, exits immediately |
+| `Route.badRequest` | `Text ->{Route.Done} r` | 400, exits immediately |
+| `Route.unauthorized` | `Text ->{Route.Done} r` | 401, exits immediately |
+| `Route.forbidden` | `Text ->{Route.Done} r` | 403, exits immediately |
+| `Route.notFound` | `Text ->{Route.Done} r` | 404, exits immediately |
+| `Route.conflict` | `Text ->{Route.Done} r` | 409, exits immediately |
+| `Route.serverError` | `Text ->{Route.Done} r` | 500, exits immediately |
+| `Route.okJson` | `Text ->{Route.Done} r` | 200 + `Content-Type: application/json` |
+| `Route.respond` | `Nat -> Text ->{Route.Done} r` | Raw status + body, exits immediately |
+| `Route.guard.badRequest` | `Boolean -> Text ->{Route.Done} ()` | Exits 400 if true, returns `()` otherwise |
+| `Route.guard.unauthorized` | `Boolean -> Text ->{Route.Done} ()` | Exits 401 if true |
+| `Route.guard.forbidden` | `Boolean -> Text ->{Route.Done} ()` | Exits 403 if true |
+| `Route.guard.notFound` | `Boolean -> Text ->{Route.Done} ()` | Exits 404 if true |
+| `Route.guard.conflict` | `Boolean -> Text ->{Route.Done} ()` | Exits 409 if true |
+| `Route.guard` | `Boolean -> Nat -> Text ->{Route.Done} ()` | Generic guard, any status |
+| `Route.require` | `Optional a -> Text ->{Route.Done} a` | Unwrap or exit 400 |
+| `Route.requireFound` | `Optional a -> Text ->{Route.Done} a` | Unwrap or exit 404 |
+
+#### Key design decisions
+
+- `structural` ability keyword — avoids hash-mismatch across library versions
+- Continuation `_k` explicitly bound and discarded in `Route.handle` — correct Unison handler syntax
+- Guards return `()` not `r` — makes sequential composition typecheck without `when` incompatibility
+- `HttpResponse` defined in the library — self-contained, no external dependency
+- `when` incompatibility documented throughout — use `Route.guard.*` instead
+- Replaces nebulous `Abort` threading: `Abort` loses the response value on exit; `Route.Done` carries it typed
+
+#### Examples included
+
+- `examples/validation.u` — query param validation
+- `examples/auth_gate.u` — token + role enforcement
+- `examples/multi_step.u` — validate / persist / respond in sequence
+- `examples/shared_helpers.u` — reusable helpers that own their own failure responses
+
+#### Integration with Grim
+
+The intended integration point is `Grim.Handlers.Local` and `Grim.Handlers.Cloud`. Each HTTP route handler wraps its body in `Route.handle do ...`. Every helper that may exit early carries `{Route.Done}` in its type row. `Route.handle` eliminates the ability at the dispatch boundary — the outer handler stack (`runLocal` / `runCloud`) does not need to know about it.
+
+---
+
 ## Session: 2026-06-19 (continued)
 
 ### Grim.Handlers.Cloud — COMPLETE
@@ -27,11 +82,11 @@ Full Unison Cloud handler file. Every ability in `Grim.Abilities` is satisfied b
 
 #### Security upgrade: KMS boundary
 
-In `Local.u`, key material (AES keys, Ed25519 private keys) is derived locally via `scryptDeriveKey` / platform FFI and lives briefly in process memory. In `Cloud.u` all key operations route through the cloud KMS (`cloudKmsEncrypt`, `cloudKmsSignJWT`, `cloudKmsProvisionCert`). The Grim process never holds raw key material. This is the Lancia security model applied uniformly across all nine abilities.
+In `Local.u`, key material lives briefly in process memory. In `Cloud.u` all key operations route through the cloud KMS. The Grim process never holds raw key material. This is the Lancia security model applied uniformly across all nine abilities.
 
 #### Governance side effect
 
-`handleGovernanceCloud.setMode` has one addition over `handleGovernanceLocal`: after persisting the new mode it calls `cloudEventEmit "governance"` to propagate the change to all nodes via the event bus. The local handler writes to a config file and relies on the single process reading it. The cloud handler broadcasts immediately, keeping distributed nodes consistent without polling.
+`handleGovernanceCloud.setMode` calls `cloudEventEmit "governance"` after persisting the new mode, propagating the change to all nodes via the event bus immediately.
 
 ---
 
@@ -41,34 +96,19 @@ Repo: [github.com/5mil/unison-filestore](https://github.com/5mil/unison-filestor
 Version: `0.1.0`  
 License: MIT
 
-The `FileIO` ability and all entity/user store functions extracted as a standalone Unison library. Zero dependency on Grim types or abilities. Can be dropped into any Unison application needing a content-addressed file store without an external DB engine.
-
-#### Additions over `Grim/Store/FileStore.u`
-
-| Area | Delta |
-|---|---|
-| `EntityType` | `CustomEntity Text` variant added |
-| `textToEntityType` | `custom:<name>` prefix round-trip handled |
-| `Entity` / `User` / `Role` / `Tier` | Self-contained — zero Grim dependency |
-| `fsUpdateEntity` | Unused `_deserialise` param removed |
-| Path helpers | All promoted to named functions |
-| Tests | 7 → 11 (adds `testCustomEntityType`, `testMockFileExists`, `testMockDelete`, `testMockHashDeterministic`) |
-| Docs | `README.md`, `USAGE.md`, `WHITEPAPER.md` |
-| `handleAuthFS` / `handleKnowledgeFS` | Excluded — depend on Grim-specific abilities; library owns storage primitives only |
+The `FileIO` ability and all entity/user store functions extracted as a standalone Unison library. Zero dependency on Grim types or abilities.
 
 ---
 
 ### Grim.Store.FileStore — COMPLETE
 
-File: `Grim/Store/FileStore.u` | Commit: `d25b5d0e`  
-Entire Knowledge + Auth persistence layer. Unison-native. Zero SQLite. Zero ORM.
+File: `Grim/Store/FileStore.u` | Commit: `d25b5d0e`
 
 ---
 
 ### Grim.Shim.Stratum — COMPLETE
 
-File: `Grim/Shim/Stratum.u` | Commit: `83a64a12`  
-Full Stratum V1 TCP shim in Unison. Pure parser + dispatcher, `StratumSocket` ability (swappable for tests), `ShimQueues` bridge, `shimNodeMonitor`, `runShim` composition.
+File: `Grim/Shim/Stratum.u` | Commit: `83a64a12`
 
 ---
 
@@ -87,22 +127,24 @@ Full Stratum V1 TCP shim in Unison. Pure parser + dispatcher, `StratumSocket` ab
 | Grim.Store.FileStore | ✅ | `d25b5d0e` |
 | Grim.Shim.Stratum | ✅ | `83a64a12` |
 | Grim.Handlers.Cloud | ✅ | `10b8d453` |
+| Grim.Route (via unison-route-done) | ✅ | standalone lib |
 
 ---
 
 ## Open Design Questions (unresolved)
 
-1. **Browser cert flow** — confirmed: thin vanilla JS shell calling Grim HTTP endpoints. No work needed in this codebase.
-2. **NocoBase frontend** — decision pending: retain as read layer or replace with Unison-served interface.
-3. **ShimQueues spin-poll** — replace with UCM `Channel`/`Scope` when available. Handler swap only; no logic change.
+1. **Browser cert flow** — thin vanilla JS shell calling Grim HTTP endpoints. No work needed here.
+2. **NocoBase frontend** — retain as read layer or replace with Unison-served interface.
+3. **ShimQueues spin-poll** — replace with UCM `Channel`/`Scope` when available.
 
 ---
 
 ## Remaining Work
 
+- [ ] Wire `unison-route-done` into `Grim.Handlers.Local` and `Grim.Handlers.Cloud` dispatch
 - [ ] Resolve NocoBase frontend decision
 - [ ] Replace `ShimQueues` spin-poll with UCM `Channel`/`Scope`
-- [ ] Implement the 20 platform FFI stubs (native shim layer, outside Unison)
+- [ ] Implement the 20 platform FFI stubs
 - [ ] Wire `runLocal` / `runCloud` to a UCM `main` entry point
 - [ ] Browser cert UI (thin vanilla JS, calls Grim HTTP endpoints)
 
